@@ -6,15 +6,26 @@ import jwt from "jsonwebtoken";
 const prisma = new PrismaClient();
 
 export const register = async (req: Request, res: Response) => {
-  const { name, email, password } = req.body;
+  const { username, email, password } = req.body;
 
   const hashed = await bcrypt.hash(password, 10);
 
   const user = await prisma.user.create({
-    data: { name, email, password: hashed }
+    data: { name: username, email, password: hashed }
   });
 
-  res.json(user);
+  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET!, {
+    expiresIn: "1d"
+  });
+
+  const mappedUser = {
+    id: user.id,
+    email: user.email,
+    username: user.name,
+    createdAt: user.createdAt,
+  };
+
+  res.json({ token, user: mappedUser });
 };
 
 export const login = async (req: Request, res: Response) => {
@@ -31,5 +42,29 @@ export const login = async (req: Request, res: Response) => {
     expiresIn: "1d"
   });
 
-  res.json({ token });
+  const mappedUser = {
+    id: user.id,
+    email: user.email,
+    username: user.name,
+    createdAt: user.createdAt,
+  };
+
+  res.json({ token, user: mappedUser });
+};
+
+export const me = async (req: Request & { userId?: string }, res: Response) => {
+  const userId = req.userId;
+  if (!userId) return res.status(401).json({ message: "Unauthorized" });
+
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user) return res.status(404).json({ message: "User not found" });
+
+  const mappedUser = {
+    id: user.id,
+    email: user.email,
+    username: user.name,
+    createdAt: user.createdAt,
+  };
+
+  res.json(mappedUser);
 };
