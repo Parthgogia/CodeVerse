@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Mail, Lock, User, ArrowLeft, Zap, Eye, EyeOff } from 'lucide-react';
+import { Plasma } from '../components/ui/Plasma';
 import { useAuth } from '../contexts/AuthContext';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -298,21 +299,22 @@ export function AuthPage() {
     <div className="auth-page">
       {/* ── Left panel ── */}
       <div className="auth-panel">
-        {/* Background */}
-        <div className="orb orb-1" style={{ opacity: 0.25 }} />
-        <div className="orb orb-2" style={{ opacity: 0.2 }} />
-        <div className="grid-bg" />
+        {/* Plasma background on left panel */}
+        <div style={{ position:'absolute', inset:0 }}>
+          <Plasma speed={1.2} color="4413e7" opacity={0.42} mouseInteractive={false} scale={1.1} direction="pingpong" />
+          <div style={{ position:'absolute', inset:0, background:'rgba(6,6,15,0.60)' }} />
+        </div>
 
         <div className="auth-panel-content" style={{ position: 'relative', zIndex: 1 }}>
           <div className="navbar-logo" style={{ justifyContent: 'center', marginBottom: 24, fontSize: 22 }}>
             <div className="navbar-logo-icon" style={{ width: 36, height: 36 }}>
               <Zap size={18} color="#fff" strokeWidth={2.5} />
             </div>
-            CodeVerse
+            CodeSync
           </div>
           <h2 className="auth-panel-title">
             Real-time code<br />
-            <span className="gradient-text">collaboration</span>
+            <em className="gradient-text">collaboration</em>
           </h2>
           <p className="auth-panel-desc">
             Write, run, and debug code together with live cursors, CRDT sync, and Docker-sandboxed execution.
