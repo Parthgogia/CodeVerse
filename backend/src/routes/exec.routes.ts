@@ -1,8 +1,10 @@
-import { Router } from "express";
-import { runCode } from "../controllers/exec.contoller.js";
+import { Router }                       from "express";
+import { runCode, getJobStatus }         from "../controllers/exec.contoller.js";
+import { authMiddleware }                from "../middleware/auth.middleware.js";
 
 const router = Router();
 
-router.post("/", runCode);
+router.post("/",       authMiddleware, runCode);
+router.get("/:jobId",  authMiddleware, getJobStatus);
 
 export default router;

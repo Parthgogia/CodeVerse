@@ -1,47 +1,49 @@
 import { useEffect, useRef, useCallback } from 'react';
 import { execApi } from './api';
-import type { RunJob, OutputLine } from '../types/index';
+import type { RunJob, OutputLine } from '../types';
 
-interface UseJobPollerOptions {
+interface Options {
   onResult:  (lines: OutputLine[], stats: { time?: number; exit?: number }) => void;
   onError:   (msg: string) => void;
   onRunning: (v: boolean) => void;
 }
 
-interface UseJobPollerReturn {
+interface Return {
   startPolling: (jobId: string) => void;
-  stopPolling:  () => void;
+  cancelPolling: () => void;  // called by socket result handler to stop the race
 }
 
-const POLL_INTERVAL = 800;   // ms between polls
-const MAX_POLLS     = 75;    // 75 × 800 ms ≈ 60 s timeout
+const POLL_INTERVAL_MS = 900;
+const MAX_POLLS        = 67; // ~60 s
 
-export function useJobPoller({ onResult, onError, onRunning }: UseJobPollerOptions): UseJobPollerReturn {
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const countRef = useRef(0);
+export function useJobPoller({ onResult, onError, onRunning }: Options): Return {
+  const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const countRef  = useRef(0);
+  const cancelledRef = useRef(false);
 
-  const stopPolling = useCallback(() => {
+  const cancelPolling = useCallback(() => {
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
     }
-    countRef.current = 0;
+    cancelledRef.current = true;
+    countRef.current     = 0;
   }, []);
 
-  // Cleanup on unmount
-  useEffect(() => () => stopPolling(), [stopPolling]);
+  useEffect(() => () => cancelPolling(), [cancelPolling]);
 
   const startPolling = useCallback((jobId: string) => {
-    stopPolling();
+    cancelPolling();
+    cancelledRef.current = false;
+    countRef.current     = 0;
     onRunning(true);
-    countRef.current = 0;
 
     timerRef.current = setInterval(async () => {
+      if (cancelledRef.current) return;
       countRef.current += 1;
 
-      // Hard timeout
       if (countRef.current > MAX_POLLS) {
-        stopPolling();
+        cancelPolling();
         onRunning(false);
         onError('Job timed out after 60 seconds.');
         return;
@@ -51,35 +53,23 @@ export function useJobPoller({ onResult, onError, onRunning }: UseJobPollerOptio
         const job: RunJob = await execApi.poll(jobId);
 
         if (job.status === 'completed' || job.status === 'failed') {
-          stopPolling();
+          cancelPolling();
           onRunning(false);
 
           const lines: OutputLine[] = [];
-          if (job.stdout) {
-            job.stdout.split('\n').filter(Boolean).forEach((l) =>
-              lines.push({ type: 'stdout', text: l }));
-          }
-          if (job.stderr) {
-            job.stderr.split('\n').filter(Boolean).forEach((l) =>
-              lines.push({ type: 'stderr', text: l }));
-          }
-          if (lines.length === 0) {
-            lines.push({ type: 'system', text: '(no output)' });
-          }
+          job.stdout?.split('\n').filter(Boolean).forEach((l) => lines.push({ type: 'stdout', text: l }));
+          job.stderr?.split('\n').filter(Boolean).forEach((l) => lines.push({ type: 'stderr', text: l }));
+          if (!lines.length) lines.push({ type: 'system', text: '(no output)' });
 
-          onResult(lines, {
-            time: job.executionTimeMs,
-            exit: job.exitCode,
-          });
+          onResult(lines, { time: job.executionTimeMs, exit: job.exitCode });
         }
-        // status === 'pending' | 'running' → keep polling
       } catch (err: any) {
-        stopPolling();
+        cancelPolling();
         onRunning(false);
-        onError(err?.message ?? 'Failed to poll job status.');
+        onError(err?.message ?? 'Failed to poll job.');
       }
-    }, POLL_INTERVAL);
-  }, [stopPolling, onResult, onError, onRunning]);
+    }, POLL_INTERVAL_MS);
+  }, [cancelPolling, onResult, onError, onRunning]);
 
-  return { startPolling, stopPolling };
+  return { startPolling, cancelPolling };
 }

@@ -1,107 +1,109 @@
 import { useEffect, useRef, useCallback } from 'react';
 import * as Y from 'yjs';
 import type * as Monaco from 'monaco-editor';
-import { connectSocket, SocketEvents } from './socket';
+import { connectSocket } from './socket';
 import type { User } from '../types';
 
 // ── Types ─────────────────────────────────────────────────
 interface AwarenessState {
-  userId:   string;
-  username: string;
-  color:    string;
-  cursor:   { lineNumber: number; column: number } | null;
-  selection?: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number } | null;
+  userId:    string;
+  username:  string;
+  color:     string;
+  cursor:    { lineNumber: number; column: number } | null;
+  selection: { startLineNumber: number; startColumn: number; endLineNumber: number; endColumn: number } | null;
 }
 
-const USER_COLORS = [
-  '#3b82f6', '#10b981', '#f59e0b', '#ef4444',
-  '#8b5cf6', '#06b6d4', '#ec4899', '#f97316',
-];
+const PALETTE = ['#5b4ef0','#10b981','#f59e0b','#f43f5e','#8b5cf6','#22d3ee','#ec4899','#f97316'];
 
-function colorForUser(userId: string): string {
-  const hash = userId.split('').reduce((a, c) => a + c.charCodeAt(0), 0);
-  return USER_COLORS[hash % USER_COLORS.length];
+function colorForUser(id: string): string {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h + id.charCodeAt(i)) & 0xffffffff;
+  return PALETTE[Math.abs(h) % PALETTE.length];
 }
 
-// CSS style injection for remote cursors
-function injectCursorStyles(userId: string, color: string): void {
-  const styleId = `cursor-style-${userId}`;
-  if (document.getElementById(styleId)) return;
-  const style = document.createElement('style');
-  style.id = styleId;
-  style.textContent = `
+// Per-user CSS is injected once so Monaco cursor decorations render
+const injectedStyles = new Set<string>();
+function injectCursorCSS(userId: string, color: string): void {
+  if (injectedStyles.has(userId)) return;
+  injectedStyles.add(userId);
+  const el = document.createElement('style');
+  el.textContent = `
     .remote-cursor-${userId} {
       border-left: 2px solid ${color};
-      box-shadow: 0 0 6px ${color}88;
+      box-shadow: 0 0 4px ${color}88;
       margin-left: -1px;
     }
-    .remote-cursor-label-${userId} {
+    .remote-cursor-label-${userId}::before {
+      content: attr(data-username);
       position: absolute;
-      top: -18px;
-      left: -1px;
-      padding: 2px 6px;
+      top: -18px; left: -1px;
+      padding: 1px 6px;
       background: ${color};
       color: #fff;
       font-size: 10px;
       font-weight: 600;
       border-radius: 3px 3px 3px 0;
       white-space: nowrap;
-      font-family: var(--font-body);
+      font-family: var(--font-sans);
       pointer-events: none;
       line-height: 1.4;
     }
     .remote-selection-${userId} {
-      background: ${color}20;
-      border: 1px solid ${color}40;
-    }
-  `;
-  document.head.appendChild(style);
+      background: ${color}1e;
+      border: 1px solid ${color}35;
+    }`;
+  document.head.appendChild(el);
 }
 
-// ── Main hook ─────────────────────────────────────────────
-interface UseYjsEditorOptions {
-  roomId:  string;
-  user:    User | null;
-  enabled: boolean;
+// ── Hook ──────────────────────────────────────────────────
+interface Options {
+  roomId:        string;
+  user:          User | null;
+  enabled:       boolean;
   onCodeChange?: (code: string) => void;
 }
 
-interface UseYjsEditorReturn {
-  bindEditor:   (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
-  unbindEditor: () => void;
-  ydoc:         React.MutableRefObject<Y.Doc | null>;
+interface YjsEditorReturn {
+  /** Seed the Y.Text with code from room:state BEFORE the editor is bound */
+  initializeCode:  (code: string) => void;
+  bindEditor:      (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
+  unbindEditor:    () => void;
 }
 
-export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEditorOptions): UseYjsEditorReturn {
-  const ydocRef          = useRef<Y.Doc | null>(null);
-  const ytextRef         = useRef<Y.Text | null>(null);
-  const editorRef        = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
-  const monacoRef        = useRef<typeof import('monaco-editor') | null>(null);
-  const decorationsRef   = useRef<Map<string, string[]>>(new Map());
-  const suppressYjs      = useRef(false);
-  const suppressMonaco   = useRef(false);
+export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): YjsEditorReturn {
+  const ydocRef        = useRef<Y.Doc | null>(null);
+  const ytextRef       = useRef<Y.Text | null>(null);
+  const editorRef      = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const monacoRef      = useRef<typeof import('monaco-editor') | null>(null);
+  const decorationsRef = useRef<Map<string, string[]>>(new Map());
 
-  // ── Init Yjs doc ─────────────────────────────────────────
+  // Guards to prevent echo loops
+  const suppressYjs    = useRef(false);   // true while applying Monaco edit → don't re-apply to Monaco
+  const suppressMonaco = useRef(false);   // true while applying Yjs update → don't emit back to server
+  const initialized    = useRef(false);   // true once initializeCode() has been called
+
+  // ── Create Y.Doc on mount ──────────────────────────────
   useEffect(() => {
     if (!enabled) return;
     const ydoc  = new Y.Doc();
     const ytext = ydoc.getText('code');
     ydocRef.current  = ydoc;
     ytextRef.current = ytext;
+    initialized.current = false;
 
     return () => {
       ydoc.destroy();
       ydocRef.current  = null;
       ytextRef.current = null;
+      initialized.current = false;
     };
   }, [enabled, roomId]);
 
-  // ── Socket: receive Yjs updates ──────────────────────────
+  // ── Socket: receive Yjs binary updates + awareness ─────
   useEffect(() => {
     if (!enabled || !user) return;
     const socket = connectSocket();
 
-    // Receive Yjs binary update
     const onYjsUpdate = ({ update }: { update: number[] }) => {
       const ydoc = ydocRef.current;
       if (!ydoc) return;
@@ -110,8 +112,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
       suppressMonaco.current = false;
     };
 
-    // Receive awareness (cursors) from other users
-    const onCursorUpdate = (state: AwarenessState) => {
+    const onAwareness = (state: AwarenessState) => {
       if (state.userId === user.id) return;
       renderRemoteCursor(state);
     };
@@ -121,45 +122,78 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
     };
 
     socket.on('yjs:update',    onYjsUpdate);
-    socket.on('yjs:awareness', onCursorUpdate);
-    socket.on(SocketEvents.USER_LEFT, onUserLeft);
+    socket.on('yjs:awareness', onAwareness);
+    socket.on('room:user-left', onUserLeft);
 
     return () => {
       socket.off('yjs:update',    onYjsUpdate);
-      socket.off('yjs:awareness', onCursorUpdate);
-      socket.off(SocketEvents.USER_LEFT, onUserLeft);
+      socket.off('yjs:awareness', onAwareness);
+      socket.off('room:user-left', onUserLeft);
     };
   }, [enabled, user, roomId]);
 
-  // ── Render remote cursor decorations ─────────────────────
+  // ── initializeCode — called by EditorPage on room:state ─
+  // Seeds the Y.Text so the first remote Yjs diff is applied correctly.
+  // Must be called before or after bindEditor — both orderings are safe.
+  const initializeCode = useCallback((code: string) => {
+    const ytext = ytextRef.current;
+    if (!ytext) return;
+
+    initialized.current = true;
+    suppressYjs.current = true;
+    try {
+      // Replace entire Y.Text atomically
+      const current = ytext.toString();
+      if (current !== code) {
+        ytext.delete(0, ytext.length);
+        if (code) ytext.insert(0, code);
+      }
+    } finally {
+      suppressYjs.current = false;
+    }
+
+    // If editor is already bound, sync Monaco to match
+    const editor = editorRef.current;
+    if (editor) {
+      const model = editor.getModel();
+      if (model && model.getValue() !== code) {
+        suppressMonaco.current = true;
+        model.setValue(code);
+        suppressMonaco.current = false;
+      }
+    }
+
+    onCodeChange?.(code);
+  }, [onCodeChange]);
+
+  // ── Remote cursor rendering ────────────────────────────
   const renderRemoteCursor = useCallback((state: AwarenessState) => {
     const editor = editorRef.current;
     const monaco = monacoRef.current;
     if (!editor || !monaco || !state.cursor) return;
 
     const color = state.color || colorForUser(state.userId);
-    injectCursorStyles(state.userId, color);
+    injectCursorCSS(state.userId, color);
 
-    const decorations: Monaco.editor.IModelDeltaDecoration[] = [];
-
-    // Cursor line
-    if (state.cursor) {
-      decorations.push({
+    const decorations: Monaco.editor.IModelDeltaDecoration[] = [
+      {
         range: new monaco.Range(
           state.cursor.lineNumber, state.cursor.column,
           state.cursor.lineNumber, state.cursor.column,
         ),
         options: {
-          className:    `remote-cursor-${state.userId}`,
+          className:            `remote-cursor-${state.userId}`,
           beforeContentClassName: `remote-cursor-label-${state.userId}`,
-          stickiness:   monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-          hoverMessage: { value: state.username },
+          stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+          hoverMessage: { value: `**${state.username}**` },
         },
-      });
-    }
+      },
+    ];
 
-    // Selection highlight
-    if (state.selection) {
+    if (state.selection && !(
+      state.selection.startLineNumber === state.selection.endLineNumber &&
+      state.selection.startColumn     === state.selection.endColumn
+    )) {
       decorations.push({
         range: new monaco.Range(
           state.selection.startLineNumber, state.selection.startColumn,
@@ -172,10 +206,9 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
       });
     }
 
-    // Apply
-    const oldDecorations = decorationsRef.current.get(state.userId) ?? [];
-    const newDecorations  = editor.deltaDecorations(oldDecorations, decorations);
-    decorationsRef.current.set(state.userId, newDecorations);
+    const old  = decorationsRef.current.get(state.userId) ?? [];
+    const next = editor.deltaDecorations(old, decorations);
+    decorationsRef.current.set(state.userId, next);
   }, []);
 
   const clearRemoteCursor = useCallback((userId: string) => {
@@ -186,7 +219,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
     decorationsRef.current.delete(userId);
   }, []);
 
-  // ── Bind editor instance ─────────────────────────────────
+  // ── bindEditor ─────────────────────────────────────────
   const bindEditor = useCallback((
     editor: Monaco.editor.IStandaloneCodeEditor,
     monaco: typeof import('monaco-editor'),
@@ -201,22 +234,20 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
     if (!ytext) return;
 
     // ── Yjs → Monaco ─────────────────────────────────────
-    const onYjsChange = (events: Y.YEvent<any>[]) => {
+    const onYjsChange = () => {
       if (suppressYjs.current) return;
       const model = editor.getModel();
       if (!model) return;
 
       suppressMonaco.current = true;
       try {
-        // Reconstruct full text from Yjs (simple + reliable)
-        const fullText = ytext.toString();
-        const currentText = model.getValue();
-        if (fullText !== currentText) {
-          const savedPos = editor.getPosition();
-          model.setValue(fullText);
-          if (savedPos) editor.setPosition(savedPos);
+        const newText = ytext.toString();
+        if (model.getValue() !== newText) {
+          const pos = editor.getPosition();
+          model.setValue(newText);
+          if (pos) editor.setPosition(pos);
+          onCodeChange?.(newText);
         }
-        onCodeChange?.(fullText);
       } finally {
         suppressMonaco.current = false;
       }
@@ -227,21 +258,20 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
     // ── Monaco → Yjs ─────────────────────────────────────
     const disposeChange = editor.onDidChangeModelContent((e) => {
       if (suppressMonaco.current) return;
-      const model = editor.getModel();
-      if (!model) return;
 
       suppressYjs.current = true;
       try {
         const ydoc = ydocRef.current!;
         ydoc.transact(() => {
-          // Apply each Monaco change to Yjs
-          for (const change of [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset)) {
-            ytext.delete(change.rangeOffset, change.rangeLength);
-            if (change.text) ytext.insert(change.rangeOffset, change.text);
+          // Apply changes in reverse offset order so offsets stay correct
+          const sorted = [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
+          for (const ch of sorted) {
+            if (ch.rangeLength > 0) ytext.delete(ch.rangeOffset, ch.rangeLength);
+            if (ch.text)            ytext.insert(ch.rangeOffset, ch.text);
           }
         });
 
-        // Broadcast Yjs update
+        // Broadcast binary Yjs diff
         const update = Y.encodeStateAsUpdate(ydoc);
         socket.emit('yjs:update', { roomId, update: Array.from(update) });
         onCodeChange?.(ytext.toString());
@@ -250,62 +280,63 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: UseYjsEdit
       }
     });
 
-    // ── Broadcast cursor position (awareness) ─────────────
+    // ── Cursor awareness ──────────────────────────────────
+    const color = colorForUser(user.id);
+
     const disposePos = editor.onDidChangeCursorPosition((e) => {
-      const color = colorForUser(user.id);
-      const awareness: AwarenessState = {
-        userId:   user.id,
-        username: user.username,
-        color,
-        cursor: { lineNumber: e.position.lineNumber, column: e.position.column },
-        selection: null,
-      };
-      socket.emit('yjs:awareness', { roomId, state: awareness });
+      socket.emit('yjs:awareness', {
+        roomId,
+        state: {
+          userId:    user.id,
+          username:  user.username,
+          color,
+          cursor:    { lineNumber: e.position.lineNumber, column: e.position.column },
+          selection: null,
+        } satisfies AwarenessState,
+      });
     });
 
     const disposeSel = editor.onDidChangeCursorSelection((e) => {
-      const sel = e.selection;
+      const sel     = e.selection;
       const isEmpty = sel.isEmpty();
-      const color = colorForUser(user.id);
-      const awareness: AwarenessState = {
-        userId:   user.id,
-        username: user.username,
-        color,
-        cursor: { lineNumber: sel.positionLineNumber, column: sel.positionColumn },
-        selection: isEmpty ? null : {
-          startLineNumber: sel.startLineNumber,
-          startColumn:     sel.startColumn,
-          endLineNumber:   sel.endLineNumber,
-          endColumn:       sel.endColumn,
-        },
-      };
-      socket.emit('yjs:awareness', { roomId, state: awareness });
+      socket.emit('yjs:awareness', {
+        roomId,
+        state: {
+          userId:    user.id,
+          username:  user.username,
+          color,
+          cursor:    { lineNumber: sel.positionLineNumber, column: sel.positionColumn },
+          selection: isEmpty ? null : {
+            startLineNumber: sel.startLineNumber, startColumn: sel.startColumn,
+            endLineNumber:   sel.endLineNumber,   endColumn:   sel.endColumn,
+          },
+        } satisfies AwarenessState,
+      });
     });
 
-    // Store disposables for cleanup
+    // Stash disposables
     (editor as any).__yjsDisposables = [disposeChange, disposePos, disposeSel];
-    (editor as any).__yjsObserver   = onYjsChange;
-  }, [enabled, user, roomId, onCodeChange, renderRemoteCursor]);
+    (editor as any).__yjsObserver    = onYjsChange;
+  }, [enabled, user, roomId, onCodeChange]);
 
-  // ── Unbind ────────────────────────────────────────────────
+  // ── unbindEditor ───────────────────────────────────────
   const unbindEditor = useCallback(() => {
     const editor = editorRef.current;
     const ytext  = ytextRef.current;
 
     if (editor) {
-      const disposables = (editor as any).__yjsDisposables ?? [];
-      disposables.forEach((d: Monaco.IDisposable) => d.dispose());
+      const disposables: Monaco.IDisposable[] = (editor as any).__yjsDisposables ?? [];
+      disposables.forEach((d) => d.dispose());
       const observer = (editor as any).__yjsObserver;
       if (observer && ytext) ytext.unobserve(observer);
     }
 
-    // Clear all remote decorations
-    decorationsRef.current.forEach((_, userId) => clearRemoteCursor(userId));
+    decorationsRef.current.forEach((_, id) => clearRemoteCursor(id));
     decorationsRef.current.clear();
 
     editorRef.current = null;
     monacoRef.current = null;
   }, [clearRemoteCursor]);
 
-  return { bindEditor, unbindEditor, ydoc: ydocRef };
+  return { initializeCode, bindEditor, unbindEditor };
 }

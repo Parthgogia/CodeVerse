@@ -6,19 +6,26 @@ export interface AuthRequest extends Request {
 }
 
 export const authMiddleware = (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const token = req.headers.authorization?.split(" ")[1];
+  req:  AuthRequest,
+  res:  Response,
+  next: NextFunction,
+): void => {
+  const authHeader = req.headers.authorization;
+  const token      = authHeader?.startsWith("Bearer ")
+    ? authHeader.slice(7)
+    : authHeader;           // also accept bare token (non-standard but forgiving)
 
-  if (!token) return res.status(401).json({ message: "No token" });
+  if (!token) {
+    res.status(401).json({ message: "No token provided" });
+    return;
+  }
 
   try {
-    const decoded: any = jwt.verify(token, process.env.JWT_SECRET!);
-    req.userId = decoded.userId;
+    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { userId: string };
+    req.userId    = decoded.userId;
     next();
-  } catch {
-    res.status(401).json({ message: "Invalid token" });
+  } catch (err: any) {
+    const message = err?.name === "TokenExpiredError" ? "Token expired" : "Invalid token";
+    res.status(401).json({ message });
   }
 };

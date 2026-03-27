@@ -1,4 +1,5 @@
-import type { AuthResponse, Room, CreateRoomInput, RunJob } from '../types/index';
+import type { AuthResponse, Room, CreateRoomInput, RunJob } from '../types';
+import { getSocket } from './socket';
 
 const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
 
@@ -20,7 +21,6 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
     const body = await res.json().catch(() => ({}));
     throw new Error(body?.message ?? `HTTP ${res.status}`);
   }
-  // 204 No Content
   if (res.status === 204) return undefined as T;
   return res.json();
 }
@@ -44,33 +44,25 @@ export const authApi = {
 
 // ── Rooms ─────────────────────────────────────────────────
 export const roomsApi = {
-  list: () => req<Room[]>('/api/rooms'),
-
-  get: (id: string) => req<Room>(`/api/rooms/${id}`),
-
-  create: (data: CreateRoomInput) =>
-    req<Room>('/api/rooms', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
-
+  list:   ()                              => req<Room[]>('/api/rooms'),
+  get:    (id: string)                    => req<Room>(`/api/rooms/${id}`),
+  create: (data: CreateRoomInput)         => req<Room>('/api/rooms', { method: 'POST', body: JSON.stringify(data) }),
   update: (id: string, data: Partial<CreateRoomInput>) =>
-    req<Room>(`/api/rooms/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify(data),
-    }),
-
-  delete: (id: string) =>
-    req<void>(`/api/rooms/${id}`, { method: 'DELETE' }),
+    req<Room>(`/api/rooms/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  delete:    (id: string)                 => req<void>(`/api/rooms/${id}`, { method: 'DELETE' }),
+  snapshots: (id: string)                 => req<{ id: string; createdAt: string; content: string }[]>(`/api/rooms/${id}/snapshots`),
 };
 
-// ── Code Execution ────────────────────────────────────────
+// ── Execution ─────────────────────────────────────────────
 export const execApi = {
-  run: (roomId: string, code: string, language: string) =>
-    req<{ jobId: string }>('/api/execute', {
-      method: 'POST',
-      body: JSON.stringify({ roomId, code, language }),
-    }),
-
+  run: (roomId: string, code: string, language: string) => {
+    // Pass socket ID so backend can emit result directly to this connection
+    const socketId = getSocket().id ?? '';
+    return req<{ jobId: string }>('/api/execute', {
+      method:  'POST',
+      headers: { 'x-socket-id': socketId },
+      body:    JSON.stringify({ roomId, code, language }),
+    });
+  },
   poll: (jobId: string) => req<RunJob>(`/api/execute/${jobId}`),
 };

@@ -1,70 +1,73 @@
 import type { Request, Response } from "express";
-import { PrismaClient } from "@prisma/client";
-import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
+import bcrypt                      from "bcrypt";
+import jwt                         from "jsonwebtoken";
+import type { AuthRequest }        from "../middleware/auth.middleware.js";
+import { prisma } from "../config/db.js";
 
-const prisma = new PrismaClient();
 
-export const register = async (req: Request, res: Response) => {
-  const { username, email, password } = req.body;
+// ── Shared mapper ─────────────────────────────────────────
+function mapUser(user: { id: string; email: string; name: string; createdAt: Date }) {
+  return { id: user.id, email: user.email, username: user.name, createdAt: user.createdAt };
+}
 
-  const hashed = await bcrypt.hash(password, 10);
+function signToken(userId: string): string {
+  return jwt.sign({ userId }, process.env.JWT_SECRET!, { expiresIn: "7d" });
+}
 
-  const user = await prisma.user.create({
-    data: { name: username, email, password: hashed }
-  });
+// ── POST /api/auth/register ───────────────────────────────
+export const register = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { username, email, password } = req.body;
 
-  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET!, {
-    expiresIn: "1d"
-  });
+    if (!username?.trim()) { res.status(400).json({ message: "Username is required" }); return; }
+    if (!email?.trim())    { res.status(400).json({ message: "Email is required" });    return; }
+    if (!password)         { res.status(400).json({ message: "Password is required" }); return; }
+    if (password.length < 8) { res.status(400).json({ message: "Password must be at least 8 characters" }); return; }
 
-  const mappedUser = {
-    id: user.id,
-    email: user.email,
-    username: user.name,
-    createdAt: user.createdAt,
-  };
+    const exists = await prisma.user.findUnique({ where: { email } });
+    if (exists) { res.status(409).json({ message: "Email already in use" }); return; }
 
-  res.json({ token, user: mappedUser });
+    const hashed = await bcrypt.hash(password, 10);
+    const user   = await prisma.user.create({
+      data: { name: username.trim(), email: email.trim().toLowerCase(), password: hashed },
+    });
+
+    res.status(201).json({ token: signToken(user.id), user: mapUser(user) });
+  } catch (err) {
+    console.error("[auth] register error:", err);
+    res.status(500).json({ message: "Registration failed" });
+  }
 };
 
-export const login = async (req: Request, res: Response) => {
-  const { email, password } = req.body;
+// ── POST /api/auth/login ──────────────────────────────────
+export const login = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { email, password } = req.body;
 
-  const user = await prisma.user.findUnique({ where: { email } });
+    if (!email || !password) { res.status(400).json({ message: "Email and password are required" }); return; }
 
-  if (!user) return res.status(404).json({ message: "User not found" });
+    const user = await prisma.user.findUnique({ where: { email: email.trim().toLowerCase() } });
+    if (!user) { res.status(401).json({ message: "Invalid credentials" }); return; }
 
-  const valid = await bcrypt.compare(password, user.password);
-  if (!valid) return res.status(401).json({ message: "Invalid credentials" });
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) { res.status(401).json({ message: "Invalid credentials" }); return; }
 
-  const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET!, {
-    expiresIn: "1d"
-  });
-
-  const mappedUser = {
-    id: user.id,
-    email: user.email,
-    username: user.name,
-    createdAt: user.createdAt,
-  };
-
-  res.json({ token, user: mappedUser });
+    res.json({ token: signToken(user.id), user: mapUser(user) });
+  } catch (err) {
+    console.error("[auth] login error:", err);
+    res.status(500).json({ message: "Login failed" });
+  }
 };
 
-export const me = async (req: Request & { userId?: string }, res: Response) => {
-  const userId = req.userId;
-  if (!userId) return res.status(401).json({ message: "Unauthorized" });
-
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user) return res.status(404).json({ message: "User not found" });
-
-  const mappedUser = {
-    id: user.id,
-    email: user.email,
-    username: user.name,
-    createdAt: user.createdAt,
-  };
-
-  res.json(mappedUser);
+// ── GET /api/auth/me ──────────────────────────────────────
+export const me = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.userId! } });
+    if (!user) { res.status(404).json({ message: "User not found" }); return; }
+    // Return just the user — no token (frontend already has it)
+    res.json(mapUser(user));
+  } catch (err) {
+    console.error("[auth] me error:", err);
+    res.status(500).json({ message: "Failed to fetch user" });
+  }
 };

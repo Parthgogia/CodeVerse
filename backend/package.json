@@ -5,20 +5,22 @@
   "main": "dist/server.js",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "tsc --project tsconfig.json",
     "start": "node dist/server.js",
-    "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev"
+    "dev": "tsx watch src/server.ts",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:push": "prisma db push",
+    "db:studio": "prisma studio"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@prisma/adapter-pg": "5.22.0",
-    "@prisma/client": "5.22.0",
+    "@prisma/client": "^5.22.0",
     "bcrypt": "^6.0.0",
-    "bullmq": "^5.71.0",
+    "bullmq": "^5.71.1",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",

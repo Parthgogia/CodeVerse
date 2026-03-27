@@ -29,7 +29,7 @@ function CodePreview() {
           <div className="preview-dot" style={{ background:'#ff5f57' }} />
           <div className="preview-dot" style={{ background:'#febc2e' }} />
           <div className="preview-dot" style={{ background:'#28c840' }} />
-          <span className="preview-title-text">solve.ts — CodeSync · Room #42</span>
+          <span className="preview-title-text">solve.ts — CodeVerse · Room #42</span>
           <div style={{ marginLeft:'auto', display:'flex', gap:5 }}>
             {FAKE_USERS.map((u) => (
               <div key={u.name} className="preview-user-pill" style={{ background:u.bg, color:u.color, border:`1px solid ${u.color}28` }}>
@@ -93,7 +93,7 @@ export function LandingPage() {
       <nav ref={navRef} className="navbar">
         <div className="navbar-logo">
           <div className="navbar-logo-icon"><Zap size={14} color="#fff" strokeWidth={2.5} /></div>
-          CodeSync
+          CodeVerse
         </div>
         <div className="navbar-links">
           <a href="#features" className="navbar-link">Features</a>
@@ -220,7 +220,7 @@ export function LandingPage() {
             Ready to build<br />
             <em className="gradient-text">something together?</em>
           </h2>
-          <p className="cta-desc">Join developers who collaborate in real-time with CodeSync.</p>
+          <p className="cta-desc">Join developers who collaborate in real-time with CodeVerse.</p>
           <Link to="/auth?tab=register">
             <Button size="xl" variant="primary" icon={<Zap size={17} />}>Create your first room</Button>
           </Link>
@@ -231,9 +231,9 @@ export function LandingPage() {
       <footer className="footer">
         <div className="navbar-logo" style={{ fontSize:14 }}>
           <div className="navbar-logo-icon" style={{ width:22, height:22 }}><Zap size={11} color="#fff" strokeWidth={2.5} /></div>
-          CodeSync
+          CodeVerse
         </div>
-        <div className="footer-copy">© 2025 CodeSync. Open source.</div>
+        <div className="footer-copy">© 2026 CodeVerse. Open source.</div>
         <div className="footer-links">
           <a href="#" className="footer-link">Privacy</a>
           <a href="#" className="footer-link">Terms</a>

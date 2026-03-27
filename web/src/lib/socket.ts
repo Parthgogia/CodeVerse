@@ -1,16 +1,21 @@
 import { io, type Socket } from 'socket.io-client';
-import { authStorage } from './auth';
+import { authStorage }      from './auth';
 
 let socket: Socket | null = null;
 
+function createSocket(): Socket {
+  return io(import.meta.env.VITE_WS_URL ?? 'http://localhost:4000', {
+    auth:                 { token: authStorage.getToken() },
+    transports:           ['websocket'],
+    autoConnect:          false,
+    reconnection:         true,
+    reconnectionDelay:    1000,
+    reconnectionAttempts: 10,
+  });
+}
+
 export function getSocket(): Socket {
-  if (!socket) {
-    socket = io(import.meta.env.VITE_WS_URL ?? 'http://localhost:3000', {
-      auth: { token: authStorage.getToken() },
-      transports: ['websocket'],
-      autoConnect: false,
-    });
-  }
+  if (!socket) socket = createSocket();
   return socket;
 }
 
@@ -20,26 +25,32 @@ export function connectSocket(): Socket {
   return s;
 }
 
+// Called on logout / room exit — forces a fresh token on next connect
 export function disconnectSocket(): void {
-  socket?.disconnect();
-  socket = null; // reset so a fresh token is used next time
+  if (socket) {
+    socket.removeAllListeners();
+    socket.disconnect();
+    socket = null;
+  }
 }
 
-// ── Typed event helpers ───────────────────────────────────
+// ── Typed event constants ─────────────────────────────────
+// Names match server handlers exactly.
 export const SocketEvents = {
   // Client → Server
   JOIN_ROOM:     'room:join',
   LEAVE_ROOM:    'room:leave',
-  CODE_CHANGE:   'code:change',
-  CURSOR_MOVE:   'cursor:move',
-  RUN_CODE:      'code:run',
+  CODE_CHANGE:   'code:change',    // plain-text fallback
+  CURSOR_MOVE:   'cursor:move',    // plain cursor fallback
+  YJS_UPDATE:    'yjs:update',     // binary Yjs diff (primary)
+  YJS_AWARENESS: 'yjs:awareness',  // cursor + selection awareness
 
   // Server → Client
+  ROOM_STATE:    'room:state',
   USER_JOINED:   'room:user-joined',
   USER_LEFT:     'room:user-left',
   CODE_UPDATE:   'code:update',
   CURSOR_UPDATE: 'cursor:update',
   RUN_RESULT:    'code:run-result',
-  ROOM_STATE:    'room:state',
   ERROR:         'error',
 } as const;

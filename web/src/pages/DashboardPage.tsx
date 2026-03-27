@@ -42,12 +42,12 @@ interface CreateModalProps {
 }
 
 function CreateRoomModal({ open, onClose, onCreate }: CreateModalProps) {
-  const [name, setName]           = useState('');
-  const [desc, setDesc]           = useState('');
-  const [lang, setLang]           = useState<Language>('python');
-  const [isPublic, setPublic]     = useState(true);
-  const [error, setError]         = useState('');
-  const [loading, setLoading]     = useState(false);
+  const [name, setName]       = useState('');
+  const [desc, setDesc]       = useState('');
+  const [lang, setLang]       = useState<Language>('python');
+  const [isPublic, setPublic] = useState(true);
+  const [error, setError]     = useState('');
+  const [loading, setLoading] = useState(false);
 
   const reset = () => { setName(''); setDesc(''); setLang('python'); setPublic(true); setError(''); };
 
@@ -161,11 +161,11 @@ interface RoomCardProps {
 }
 
 function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
-  const navigate         = useNavigate();
+  const navigate              = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
-  const menuRef          = useRef<HTMLDivElement>(null);
-  const cfg              = LANGUAGES[room.language];
-  const badge            = LANG_BADGE[room.language];
+  const menuRef               = useRef<HTMLDivElement>(null);
+  const cfg                   = LANGUAGES[room.language];
+  const badge                 = LANG_BADGE[room.language];
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -266,10 +266,11 @@ function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
 
 // ── Main Dashboard ────────────────────────────────────────
 export function DashboardPage() {
-  const { user }              = useAuth();
-  const [rooms, setRooms]     = useState<Room[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [search, setSearch]   = useState('');
+  const { user }                = useAuth();
+  const navigate                = useNavigate();
+  const [rooms, setRooms]       = useState<Room[]>([]);
+  const [loading, setLoading]   = useState(true);
+  const [search, setSearch]     = useState('');
   const [creating, setCreating] = useState(false);
 
   const load = useCallback(async () => {
@@ -300,6 +301,21 @@ export function DashboardPage() {
     }
   };
 
+  // ── Search / join handler ─────────────────────────────
+  const handleSearch = useCallback(() => {
+    const val = search.trim();
+    if (!val) return;
+
+    // Full URL pasted: http(s)://anything/room/<id>
+    const urlMatch = val.match(/\/room\/([a-zA-Z0-9_-]+)/);
+    if (urlMatch) { navigate(`/room/${urlMatch[1]}`); return; }
+
+    // Bare room ID (cuid = 25 chars, uuid = 36)
+    if (/^[a-zA-Z0-9_-]{20,}$/.test(val)) { navigate(`/room/${val}`); return; }
+
+    // Otherwise just filters in place — nothing extra needed
+  }, [search, navigate]);
+
   const filtered = rooms.filter((r) =>
     r.name.toLowerCase().includes(search.toLowerCase()) ||
     r.description?.toLowerCase().includes(search.toLowerCase())
@@ -321,22 +337,24 @@ export function DashboardPage() {
         <div className="dashboard-greeting">{greeting()}</div>
         <div className="dashboard-title">{user?.username}'s workspace</div>
 
+        {/* Search row */}
         <div className="dashboard-actions">
           <div className="dashboard-search">
             <span className="dashboard-search-icon"><Search size={15} /></span>
             <input
-              placeholder="Search rooms…"
+              placeholder="Search rooms or paste a link…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
             />
           </div>
           <Button
             variant="primary"
             size="md"
-            icon={<Plus size={16} />}
-            onClick={() => setCreating(true)}
+            icon={<Search size={15} />}
+            onClick={handleSearch}
           >
-            New room
+            Search
           </Button>
         </div>
       </div>
@@ -349,16 +367,26 @@ export function DashboardPage() {
             Your rooms
             <span className="dashboard-count">{filtered.length}</span>
           </div>
-          {rooms.length > 0 && (
-            <Button variant="ghost" size="sm" onClick={load}>
-              Refresh
+          <div style={{ display: 'flex', gap: 8 }}>
+            <Button
+              variant="primary"
+              size="sm"
+              icon={<Plus size={15} />}
+              onClick={() => setCreating(true)}
+            >
+              New room
             </Button>
-          )}
+            {rooms.length > 0 && (
+              <Button variant="ghost" size="sm" onClick={load}>
+                Refresh
+              </Button>
+            )}
+          </div>
         </div>
 
         {loading ? (
           <div className="rooms-grid">
-            {[1,2,3].map((i) => (
+            {[1, 2, 3].map((i) => (
               <div key={i} style={{
                 height: 160, borderRadius: 'var(--r-lg)',
                 background: 'var(--bg-2)',
@@ -378,7 +406,7 @@ export function DashboardPage() {
               </div>
               <p className="empty-desc">
                 {search
-                  ? 'Try a different search term.'
+                  ? 'Try a different search term, or paste a room link and press Enter.'
                   : 'Create your first room to start collaborating with teammates in real-time.'
                 }
               </p>

@@ -17,20 +17,22 @@ model User {
 }
 
 model Room {
-  id         String   @id @default(cuid())
-  name       String
-  language   String
-  ownerId    String?
-  owner      User?    @relation("RoomOwner", fields: [ownerId], references: [id])
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  snapshots  Snapshot[]
+  id          String     @id @default(cuid())
+  name        String
+  description String?
+  language    String     @default("python")
+  isPublic    Boolean    @default(true)
+  ownerId     String?
+  owner       User?      @relation("RoomOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  snapshots   Snapshot[]
 }
 
 model Snapshot {
   id        String   @id @default(cuid())
   roomId    String
-  room      Room     @relation(fields: [roomId], references: [id])
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
   content   String
   createdAt DateTime @default(now())
 }

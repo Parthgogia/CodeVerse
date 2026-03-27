@@ -1,13 +1,108 @@
 import type { Request, Response } from "express";
-import { exec } from "child_process";
+import { PrismaClient }          from "@prisma/client";
+import { execQueue, enqueueExec } from "../queues/execQueue.js";
 
-export const runCode = async (req: Request, res: Response) => {
-  const { code } = req.body;
+const prisma = new PrismaClient();
 
-  exec(`echo "${code}"`, (err, stdout, stderr) => {
-    if (err) return res.json({ error: err.message });
-    if (stderr) return res.json({ error: stderr });
+// POST /api/execute
+// Body: { roomId, code, language }
+// Returns: { jobId }
+export const runCode = async (req: Request & { userId?: string }, res: Response) => {
+  const { roomId, code, language } = req.body;
+  const userId   = (req as any).userId ?? "anonymous";
+  const socketId = (req.headers["x-socket-id"] as string) ?? "";
 
-    res.json({ output: stdout });
-  });
+  if (!code || !language) {
+    return res.status(400).json({ message: "code and language are required" });
+  }
+
+  if (!roomId) {
+    return res.status(400).json({ message: "roomId is required" });
+  }
+
+  // Verify room exists
+  const room = await prisma.room.findUnique({ where: { id: roomId } });
+  if (!room) return res.status(404).json({ message: "Room not found" });
+
+  try {
+    const jobId = await enqueueExec({ roomId, code, language, userId, socketId });
+    return res.json({ jobId });
+  } catch (err: any) {
+    console.error("[exec] Failed to enqueue job:", err);
+    return res.status(500).json({ message: "Failed to queue execution job" });
+  }
+};
+
+// GET /api/execute/:jobId
+// Polling fallback — the frontend uses this if the socket result doesn't arrive
+export const getJobStatus = async (req: Request, res: Response) => {
+  let jobId = req.params.jobId;
+  if (Array.isArray(jobId)) {
+    jobId = jobId[0];
+  }
+
+  if (!jobId) {
+    return res.status(400).json({ message: "jobId is required" });
+  }
+
+  try {
+    const [job, queueState] = await Promise.all([
+      execQueue.getJob(jobId),
+      execQueue.getJobState(jobId).catch(() => null),
+    ]);
+
+    if (!job) {
+      if (queueState === "completed" || queueState === "failed") {
+        return res.json({
+          id:              jobId,
+          status:          queueState === "completed" ? "completed" : "failed",
+          stdout:          "",
+          stderr:          queueState === "failed" ? "Job result expired from queue" : "",
+          exitCode:        queueState === "failed" ? 1 : 0,
+          executionTimeMs: 0,
+          language:        "unknown",
+          createdAt:       new Date().toISOString(),
+        });
+      }
+      return res.status(404).json({ message: "Job not found" });
+    }
+
+    const state = await job.getState();
+
+    if (state === "completed") {
+      const result = job.returnvalue as { stdout?: string; stderr?: string; exitCode?: number; executionTimeMs?: number } | undefined;
+      return res.json({
+        id:              job.id,
+        status:          "completed",
+        stdout:          result?.stdout ?? "",
+        stderr:          result?.stderr ?? "",
+        exitCode:        result?.exitCode ?? 0,
+        executionTimeMs: result?.executionTimeMs ?? 0,
+        language:        job.data.language,
+        createdAt:       new Date(job.timestamp).toISOString(),
+      });
+    }
+
+    if (state === "failed") {
+      return res.json({
+        id:        job.id,
+        status:    "failed",
+        stdout:    "",
+        stderr:    job.failedReason ?? "Job failed",
+        exitCode:  1,
+        language:  job.data.language,
+        createdAt: new Date(job.timestamp).toISOString(),
+      });
+    }
+
+    return res.json({
+      id:        job.id,
+      status:    state === "active" ? "running" : "pending",
+      language:  job.data.language,
+      createdAt: new Date(job.timestamp).toISOString(),
+    });
+  } catch (err: any) {
+    console.error("[exec] Failed to fetch job:", err);
+    return res.status(500).json({ message: "Failed to fetch job status" });
+  }
 };
