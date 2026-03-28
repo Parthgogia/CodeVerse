@@ -108,11 +108,10 @@ Frontend runs on **http://localhost:5173**. All `/api` and `/socket.io` requests
 
 | Variable         | Default                                           | Required |
 |------------------|---------------------------------------------------|----------|
-| `DATABASE_URL`   | `postgresql://postgres:password@localhost:5432/codesync` | ✅ |
+| `DATABASE_URL`   | `postgresql://postgres:password@localhost:5432/codeverse` | ✅ |
 | `JWT_SECRET`     | —                                                 | ✅       |
 | `REDIS_HOST`     | `localhost`                                       |          |
 | `REDIS_PORT`     | `6379`                                            |          |
-| `REDIS_PASSWORD` | —                                                 |          |
 | `PORT`           | `4000`                                            |          |
 | `CLIENT_ORIGIN`  | `http://localhost:5173`                           |          |
 
@@ -166,7 +165,7 @@ GET    /api/execute/:jobId       poll job status
 | TypeScript | node:20-alpine     |
 | Python     | python:3.12-alpine |
 | C++        | gcc:13             |
-| Java       | openjdk:21-slim    |
+| Java       | eclipse-temurin:21-alpine    |
 
 ## How code execution works
 
