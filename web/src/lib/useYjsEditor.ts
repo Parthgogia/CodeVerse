@@ -130,7 +130,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       socket.off('yjs:awareness', onAwareness);
       socket.off('room:user-left', onUserLeft);
     };
-  }, [enabled, user, roomId]);
+  }, [enabled, roomId, user?.id]);
 
   // ── initializeCode — called by EditorPage on room:state ─
   // Seeds the Y.Text so the first remote Yjs diff is applied correctly.
@@ -317,7 +317,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     // Stash disposables
     (editor as any).__yjsDisposables = [disposeChange, disposePos, disposeSel];
     (editor as any).__yjsObserver    = onYjsChange;
-  }, [enabled, user, roomId, onCodeChange]);
+  },[enabled, roomId, user?.id, user?.username, onCodeChange]);
 
   // ── unbindEditor ───────────────────────────────────────
   const unbindEditor = useCallback(() => {

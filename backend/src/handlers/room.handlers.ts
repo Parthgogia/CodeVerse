@@ -1,9 +1,7 @@
 import type { Server, Socket } from "socket.io";
 import { RoomManager }           from "../realtime/roomManager.js";
 import { checkRateLimit, Limits } from "../realtime/rateLimiter.js";
-import { prisma } from "../config/db.js";
-
-// Module-level — one Prisma instance shared across all handler registrations
+import { prisma }                from "../config/db.js";
 
 // ── Helpers ───────────────────────────────────────────────
 async function getLatestCode(roomId: string): Promise<string> {
@@ -14,7 +12,7 @@ async function getLatestCode(roomId: string): Promise<string> {
   return snap?.content ?? "";
 }
 
-async function handleLeave(
+export async function handleLeave(
   io:              Server,
   socket:          Socket,
   userId:          string,
@@ -36,11 +34,15 @@ async function handleLeave(
 
 // ── Register handlers for one socket connection ───────────
 export function registerRoomHandlers(io: Server, socket: Socket): void {
-  const userId:   string = socket.data.userId   as string;
-  const username: string = socket.data.username as string;
+  const userId: string = socket.data.userId as string;
 
   // ── room:join ─────────────────────────────────────────
   socket.on("room:join", async ({ roomId }: { roomId: string }) => {
+    // ✅ Wait for attachUserData to finish — username is not set until it resolves
+    await socket.data.ready;
+    const username: string = socket.data.username as string;
+
+    console.log(`[DEBUG] room:join received — userId: ${userId}, roomId: ${roomId}`);
     if (!roomId) { socket.emit("error", "roomId is required"); return; }
 
     const ok = await checkRateLimit(userId, "room:join", Limits.JOIN_ROOM);
@@ -83,12 +85,12 @@ export function registerRoomHandlers(io: Server, socket: Socket): void {
 
   // ── room:leave ─────────────────────────────────────────
   socket.on("room:leave", async ({ roomId }: { roomId: string }) => {
+    // ✅ Same guard — username must be available before leave logic
+    await socket.data.ready;
+    const username: string = socket.data.username as string;
     await handleLeave(io, socket, userId, username, roomId, true);
   });
 
   // ── ping / keep-alive ──────────────────────────────────
   socket.on("ping", (cb) => { if (typeof cb === "function") cb(); });
 }
-
-// Exported so socket.ts disconnect handler can reuse it
-export { handleLeave };

@@ -34,6 +34,15 @@ export function disconnectSocket(): void {
   }
 }
 
+export function offSocket(
+  events: { event: string; handler: (...args: any[]) => void }[]
+): void {
+  if (!socket) return;
+  for (const { event, handler } of events) {
+    socket.off(event, handler);
+  }
+}
+
 // ── Typed event constants ─────────────────────────────────
 // Names match server handlers exactly.
 export const SocketEvents = {

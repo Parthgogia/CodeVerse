@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate }  from 'react-router-dom';
 import MonacoEditor, { loader }    from '@monaco-editor/react';
 import type * as Monaco            from 'monaco-editor';
@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 
 import { roomsApi, execApi }             from '../lib/api';
-import { connectSocket, disconnectSocket, SocketEvents } from '../lib/socket';
+import { connectSocket, SocketEvents } from '../lib/socket';
 import { useAuth }                       from '../contexts/AuthContext';
 import { useToast }                      from '../contexts/ToastContext';
 import { useYjsEditor }                  from '../lib/useYjsEditor';
@@ -192,99 +192,96 @@ export function EditorPage() {
   useEffect(() => {
     if (!roomId || !user) return;
     const socket = connectSocket();
-    setConnStatus(socket.connected ? 'connected' : 'connecting');
 
-    // ── Connect ───────────────────────────────────────────
-    if (socket.connected) {
-      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
-    }
-
-    socket.on('connect', () => {
+    const onConnect = () => {
       setConnStatus('connected');
+      console.log('[DEBUG] emitting room:join (on connect), roomId:', roomId, 'userId:', user?.id);
       socket.emit(SocketEvents.JOIN_ROOM, { roomId });
-    });
+    };
 
-    // ── Reconnect ─────────────────────────────────────────
-    socket.on('reconnect', () => {
+    const onReconnect = () => {
       setConnStatus('connected');
       socket.emit(SocketEvents.JOIN_ROOM, { roomId });
       toast.success('Reconnected', 'Back in the room.');
-    });
+    };
 
-    socket.on('disconnect', () => {
+    const onDisconnect = () => {
       setConnStatus('disconnected');
       toast.warning('Disconnected', 'Trying to reconnect…');
-    });
+    };
 
-    // ── Room state (server → joiner) ─────────────────────
-    // This is the ONLY place we initialize code — seeds Yjs Y.Text with
-    // the server's authoritative snapshot, then syncs Monaco.
-    socket.on(SocketEvents.ROOM_STATE, (state: { code: string; users: ConnectedUser[] }) => {
-      // 1. Seed Yjs doc with server code so diffs apply correctly
+    const onRoomState = (state: { code: string; users: ConnectedUser[] }) => {
       initializeCode(state.code);
-      // 2. Update presence list
       setConnectedUsers(state.users);
-    });
+    };
 
-    // ── Presence ──────────────────────────────────────────
-    socket.on(SocketEvents.USER_JOINED, (u: ConnectedUser) => {
-      setConnectedUsers((p) => p.find((x)=>x.id===u.id) ? p : [...p, u]);
+    const onUserJoined = (u: ConnectedUser) => {
+      setConnectedUsers((p) => p.find((x) => x.id === u.id) ? p : [...p, u]);
       toast.info(`${u.username} joined`);
-    });
+    };
 
-    socket.on(SocketEvents.USER_LEFT, ({ userId, username }: { userId:string; username?:string }) => {
+    const onUserLeft = ({ userId, username }: { userId: string; username?: string }) => {
       setConnectedUsers((p) => p.filter((u) => u.id !== userId));
       if (username) toast.info(`${username} left`);
-    });
+    };
 
-    // ── Plain-text code update (fallback, non-Yjs clients) ─
-    socket.on(SocketEvents.CODE_UPDATE, ({ content, userId: senderId }: { content:string; userId:string }) => {
-      if (senderId === user.id) return; // ignore echo
+    const onCodeUpdate = ({ content, userId: senderId }: { content: string; userId: string }) => {
+      if (senderId === user.id) return;
       setCode(content);
-    });
+    };
 
-    // ── Run result ────────────────────────────────────────
-    // Socket result wins — cancel the HTTP poller immediately.
-    socket.on(SocketEvents.RUN_RESULT, (result: {
-      stdout:string; stderr:string; exitCode:number; executionTimeMs:number
+    const onRunResult = (result: {
+      stdout: string; stderr: string; exitCode: number; executionTimeMs: number;
     }) => {
-      cancelPolling();   // stop the fallback poller
+      cancelPolling();
       setRunning(false);
-
       const lines: OutputLine[] = [];
-      result.stdout?.split('\n').filter(Boolean).forEach((l) => lines.push({ type:'stdout', text:l }));
-      result.stderr?.split('\n').filter(Boolean).forEach((l) => lines.push({ type:'stderr', text:l }));
-      if (!lines.length) lines.push({ type:'system', text:'(no output)' });
-
+      result.stdout?.split('\n').filter(Boolean).forEach((l) => lines.push({ type: 'stdout', text: l }));
+      result.stderr?.split('\n').filter(Boolean).forEach((l) => lines.push({ type: 'stderr', text: l }));
+      if (!lines.length) lines.push({ type: 'system', text: '(no output)' });
       setOutputLines(lines);
       setRunStats({ time: result.executionTimeMs, exit: result.exitCode });
-
       if (result.exitCode === 0)
         toast.success('Run complete', `Finished in ${result.executionTimeMs}ms`);
       else
         toast.error('Run failed', `Exit code ${result.exitCode}`);
-    });
+    };
 
-    socket.on(SocketEvents.ERROR, (msg: string) => {
+    const onError = (msg: string) => {
       cancelPolling();
       setRunning(false);
       toast.error('Socket error', msg);
-    });
+    };
+
+    socket.on('connect',                    onConnect);
+    socket.on('reconnect',                  onReconnect);
+    socket.on('disconnect',                 onDisconnect);
+    socket.on(SocketEvents.ROOM_STATE,      onRoomState);
+    socket.on(SocketEvents.USER_JOINED,     onUserJoined);
+    socket.on(SocketEvents.USER_LEFT,       onUserLeft);
+    socket.on(SocketEvents.CODE_UPDATE,     onCodeUpdate);
+    socket.on(SocketEvents.RUN_RESULT,      onRunResult);
+    socket.on(SocketEvents.ERROR,           onError);
+
+    setConnStatus(socket.connected ? 'connected' : 'connecting');
+    if (socket.connected) {
+      console.log('[DEBUG] emitting room:join (already connected), roomId:', roomId, 'userId:', user?.id);
+      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
+    }
 
     return () => {
+      socket.off('connect',                    onConnect);
+      socket.off('reconnect',                  onReconnect);
+      socket.off('disconnect',                 onDisconnect);
+      socket.off(SocketEvents.ROOM_STATE,      onRoomState);
+      socket.off(SocketEvents.USER_JOINED,     onUserJoined);
+      socket.off(SocketEvents.USER_LEFT,       onUserLeft);
+      socket.off(SocketEvents.CODE_UPDATE,     onCodeUpdate);
+      socket.off(SocketEvents.RUN_RESULT,      onRunResult);
+      socket.off(SocketEvents.ERROR,           onError);
       socket.emit(SocketEvents.LEAVE_ROOM, { roomId });
-      socket.off('connect');
-      socket.off('reconnect');
-      socket.off('disconnect');
-      socket.off(SocketEvents.ROOM_STATE);
-      socket.off(SocketEvents.USER_JOINED);
-      socket.off(SocketEvents.USER_LEFT);
-      socket.off(SocketEvents.CODE_UPDATE);
-      socket.off(SocketEvents.RUN_RESULT);
-      socket.off(SocketEvents.ERROR);
-      disconnectSocket();
     };
-  }, [roomId, user, initializeCode, cancelPolling]);
+  }, [roomId, user?.id]);
 
   // ── Run code ──────────────────────────────────────────────
   const handleRun = useCallback(async () => {

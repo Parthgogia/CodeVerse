@@ -5,11 +5,19 @@ import jwt                           from "jsonwebtoken";
 import { registerRoomHandlers, handleLeave } from "../handlers/room.handlers.js";
 import { registerCodeHandlers }              from "../handlers/code.handlers.js";
 import { registerCursorHandlers }            from "../handlers/cursor.handlers.js";
-import { RoomManager}            from "./roomManager.js";
-import { prisma } from "../config/db.js";
-
+import { RoomManager }                       from "./roomManager.js";
+import { prisma }                            from "../config/db.js";
 
 interface TokenPayload { userId: string; }
+
+// Extend SocketData to include the ready promise
+declare module "socket.io" {
+  interface SocketData {
+    userId:   string;
+    username: string;
+    ready:    Promise<void>;
+  }
+}
 
 // ── Socket.IO auth middleware ─────────────────────────────
 function socketAuthMiddleware(socket: Socket, next: (err?: Error) => void) {
@@ -45,37 +53,43 @@ export function createSocketServer(httpServer: HttpServer): Server {
     },
     pingTimeout:       20_000,
     pingInterval:      10_000,
-    maxHttpBufferSize: 5 * 1024 * 1024, // 5 MB — for Yjs binary payloads
+    maxHttpBufferSize: 5 * 1024 * 1024,
   });
 
   io.use(socketAuthMiddleware);
 
-  io.on("connection", async (socket: Socket) => {
-    const ok = await attachUserData(socket);
-    if (!ok) {
-      socket.emit("error", "User not found");
-      socket.disconnect(true);
-      return;
-    }
+  // ✅ NOT async — handlers registered synchronously so no events are dropped
+  io.on("connection", (socket: Socket) => {
+    console.log(`[DEBUG] connection received, userId: ${socket.data.userId}`);
 
-    const userId:   string = socket.data.userId;
-    const username: string = socket.data.username;
-
-    console.log(`[socket] +CONNECT  ${username} (${userId}) [${socket.id}]`);
-
-    // Register domain handlers
+    // ✅ Register all handlers synchronously before any await
     registerRoomHandlers(io, socket);
     registerCodeHandlers(io, socket);
     registerCursorHandlers(io, socket);
 
+    // ✅ Store the promise — handlers await this before reading username
+    socket.data.ready = attachUserData(socket).then((ok) => {
+      console.log(`[DEBUG] attachUserData result: ${ok}`);
+      if (!ok) {
+        socket.emit("error", "User not found");
+        socket.disconnect(true);
+        return;
+      }
+      console.log(`[socket] +CONNECT  ${socket.data.username} (${socket.data.userId}) [${socket.id}]`);
+    });
+
     // ── Disconnect — single authoritative cleanup ─────────
     socket.on("disconnect", async (reason) => {
+      // Wait for username to be available before cleanup
+      await socket.data.ready;
+
+      const userId   = socket.data.userId   as string;
+      const username = socket.data.username as string;
+
       console.log(`[socket] -DISCONNECT ${username} (${userId}) — ${reason}`);
 
-      // Look up which room this socket was in BEFORE removing from presence map
       const roomId = RoomManager.getRoomForSocket(socket.id);
       if (roomId) {
-        // handleLeave removes from RoomManager, emits room:user-left
         await handleLeave(io, socket, userId, username, roomId, false);
       }
     });

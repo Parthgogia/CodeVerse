@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback } fr
 import type { User } from '../types/index';
 import { authApi } from '../lib/api';
 import { authStorage } from '../lib/auth';
+import { disconnectSocket } from '../lib/socket';
 
 interface AuthCtx {
   user: User | null;
@@ -28,6 +29,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
+    disconnectSocket(); // Disconnect old socket before changing user
     const { token, user: u } = await authApi.login(email, password);
     authStorage.setToken(token);
     authStorage.setUser(u);
@@ -35,6 +37,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const register = useCallback(async (username: string, email: string, password: string) => {
+    disconnectSocket(); // Disconnect old socket before changing user
     const { token, user: u } = await authApi.register(username, email, password);
     authStorage.setToken(token);
     authStorage.setUser(u);
@@ -42,9 +45,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logout = useCallback(() => {
-    authStorage.clear();
-    setUser(null);
-  }, []);
+  authStorage.clear();
+  setUser(null);
+  disconnectSocket(); // add this
+}, []);
 
   return (
     <AuthContext.Provider value={{ user, isLoading, isAuthenticated: !!user, login, register, logout }}>

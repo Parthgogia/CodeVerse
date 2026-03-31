@@ -1,7 +1,6 @@
 import type { Socket } from "socket.io";
-import { RoomManager }   from "../realtime/roomManager.js";
+import { RoomManager }            from "../realtime/roomManager.js";
 import { checkRateLimit, Limits } from "../realtime/rateLimiter.js";
-
 
 interface CursorPosition {
   lineNumber: number;
@@ -24,33 +23,37 @@ interface AwarenessState {
 }
 
 export function registerCursorHandlers(_io: unknown, socket: Socket) {
-  const userId:   string = (socket.data as any).userId;
-  const username: string = (socket.data as any).username;
+  const userId: string = socket.data.userId as string;
 
   // ── yjs:awareness ─────────────────────────────────────
-  // Cursor position + selection awareness (from useYjsEditor hook)
   socket.on(
     "yjs:awareness",
     async ({ roomId, state }: { roomId: string; state: AwarenessState }) => {
+      // ✅ username may still be undefined if this fires before attachUserData
+      await socket.data.ready;
+      const username: string = socket.data.username as string;
+
       if (!RoomManager.isInRoom(socket.id, roomId)) return;
 
       const ok = await checkRateLimit(userId, "cursor:move", Limits.CURSOR_MOVE);
-      if (!ok) return; // silently drop cursor events when rate-limited
+      if (!ok) return;
 
-      // Forward to everyone else in the room
       socket.to(roomId).emit("yjs:awareness", {
         ...state,
-        userId,   // always trust server-side userId
-        username, // always trust server-side username
+        userId,
+        username,
       });
     },
   );
 
   // ── cursor:move ───────────────────────────────────────
-  // Legacy / simple cursor move event (non-Yjs fallback)
   socket.on(
     "cursor:move",
     async ({ roomId, position }: { roomId: string; position: CursorPosition }) => {
+      // ✅ Same guard
+      await socket.data.ready;
+      const username: string = socket.data.username as string;
+
       if (!RoomManager.isInRoom(socket.id, roomId)) return;
 
       const ok = await checkRateLimit(userId, "cursor:move", Limits.CURSOR_MOVE);
