@@ -20,6 +20,15 @@ function mapRoom(room: any) {
   };
 }
 
+function generateRoomCode(length = 8): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+}
+
 // ── POST /api/rooms ───────────────────────────────────────
 export const createRoom = async (req: AuthRequest, res: Response) => {
   try {
@@ -28,8 +37,22 @@ export const createRoom = async (req: AuthRequest, res: Response) => {
     if (!name?.trim())     return res.status(400).json({ message: "Room name is required" });
     if (!language?.trim()) return res.status(400).json({ message: "Language is required" });
 
+    let roomCode = "";
+    let attempts = 0;
+    while (attempts < 10) {
+      roomCode = generateRoomCode(8);
+      const existing = await prisma.room.findUnique({ where: { id: roomCode } });
+      if (!existing) break;
+      attempts++;
+    }
+
+    if (!roomCode) {
+      return res.status(500).json({ message: "Failed to generate unique room code" });
+    }
+
     const room = await prisma.room.create({
       data: {
+        id:          roomCode,
         name:        name.trim(),
         description: description?.trim() || null,
         language:    language.toLowerCase(),

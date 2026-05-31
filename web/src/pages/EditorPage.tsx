@@ -7,15 +7,15 @@ import {
   X, Terminal, Users, Info, Loader2, Globe, Lock,
 } from 'lucide-react';
 
-import { roomsApi, execApi }             from '../lib/api';
-import { connectSocket, SocketEvents } from '../lib/socket';
-import { useAuth }                       from '../contexts/AuthContext';
-import { useToast }                      from '../contexts/ToastContext';
-import { useYjsEditor }                  from '../lib/useYjsEditor';
-import { useJobPoller }                  from '../lib/useJobPoller';
-import { registerMonacoTheme }           from '../lib/monacoTheme';
-import { Button }                        from '../components/ui/Button';
-import { Modal }                         from '../components/ui/Modal';
+import { roomsApi, execApi }           from '../lib/api';
+import { connectSocket, getSocket, SocketEvents } from '../lib/socket';
+import { useAuth }                     from '../contexts/AuthContext';
+import { useToast }                    from '../contexts/ToastContext';
+import { useYjsEditor }                from '../lib/useYjsEditor';
+import { useJobPoller }                from '../lib/useJobPoller';
+import { registerMonacoTheme }         from '../lib/monacoTheme';
+import { Button }                      from '../components/ui/Button';
+import { Modal }                       from '../components/ui/Modal';
 import type { Room, Language, OutputLine, ConnectedUser } from '../types';
 import { LANGUAGES } from '../types';
 
@@ -118,16 +118,33 @@ function OutputPanel({ lines, running, stats, onClear }: {
 
 function ShareModal({ roomId, open, onClose }: { roomId:string; open:boolean; onClose:()=>void }) {
   const toast = useToast();
-  const url   = `${window.location.origin}/room/${roomId}`;
-  const copy  = () => { navigator.clipboard.writeText(url); toast.success('Link copied!'); onClose(); };
+  const copy  = () => { navigator.clipboard.writeText(roomId); toast.success('Room code copied!'); onClose(); };
   return (
-    <Modal open={open} onClose={onClose} title="Share room">
-      <p style={{fontSize:14,color:'var(--tx-2)'}}>Anyone with this link can join and collaborate.</p>
-      <div className="share-link">
-        <span style={{flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',fontSize:13}}>{url}</span>
-        <button onClick={copy} style={{background:'none',border:'none',cursor:'pointer',color:'var(--ac-5)',display:'flex',flexShrink:0}}><Copy size={14}/></button>
+    <Modal open={open} onClose={onClose} title="Room Code">
+      <p style={{fontSize:14,color:'var(--tx-2)',textAlign:'center',marginBottom:16}}>
+        Share this unique code with others to collaborate.
+      </p>
+      <div style={{
+        display:'flex',
+        alignItems:'center',
+        justifyContent:'center',
+        background:'var(--bg-2)',
+        border:'1px dashed var(--bd-2)',
+        borderRadius:'var(--r-md)',
+        padding:'16px',
+        fontSize:24,
+        fontWeight:700,
+        letterSpacing:'4px',
+        fontFamily:'var(--font-mono)',
+        color:'var(--ac-5)',
+        textAlign:'center',
+        marginBottom:20,
+      }}>
+        {roomId}
       </div>
-      <Button variant="primary" size="md" icon={<Copy size={14}/>} onClick={copy} style={{width:'100%'}}>Copy link</Button>
+      <Button variant="primary" size="md" icon={<Copy size={14}/>} onClick={copy} style={{width:'100%'}}>
+        Copy code
+      </Button>
     </Modal>
   );
 }
@@ -154,12 +171,10 @@ export function EditorPage() {
   const codeRef    = useRef(code);
   codeRef.current  = code;
 
-  // Stable ref so Monaco's addCommand always calls the latest handleRun
-  // (avoids stale closure — handleEditorMount only runs once at mount)
   const handleRunRef = useRef<() => void>(() => {});
 
   // ── Yjs CRDT ─────────────────────────────────────────────
-  const { initializeCode, bindEditor, unbindEditor } = useYjsEditor({
+  const { initializeCode, setCode: setYjsCode, bindEditor, unbindEditor } = useYjsEditor({
     roomId:       roomId ?? '',
     user,
     enabled:      !!roomId && !!user,
@@ -167,10 +182,10 @@ export function EditorPage() {
   });
   useEffect(() => () => unbindEditor(), [unbindEditor]);
 
-  // ── Job poller (fallback — socket result wins the race via cancelPolling) ──
+  // ── Job poller ────────────────────────────────────────────
   const { startPolling, cancelPolling } = useJobPoller({
-    onResult: (lines, stats) => { setOutputLines(lines); setRunStats(stats); },
-    onError:  (msg) => { toast.error('Run failed', msg); setRunning(false); },
+    onResult:  (lines, stats) => { setOutputLines(lines); setRunStats(stats); },
+    onError:   (msg) => { toast.error('Run failed', msg); setRunning(false); },
     onRunning: setRunning,
   });
 
@@ -181,12 +196,18 @@ export function EditorPage() {
       .then((r) => {
         setRoom(r);
         setLanguage(r.language as Language);
-        // Starter code is shown until room:state arrives with real code
-        setCode(LANGUAGES[r.language as Language]?.starter ?? '');
+
+        // ✅ Seed Y.Text with starter code immediately so Y.Text and Monaco
+        // model are always in sync before the user can type anything.
+        // room:state will overwrite this with the real server code shortly after.
+        const starter = LANGUAGES[r.language as Language]?.starter ?? '';
+        setCode(starter);
+        initializeCode(starter);
+
         setLoading(false);
       })
       .catch(() => navigate('/dashboard'));
-  }, [roomId, navigate]);
+  }, [roomId, navigate, initializeCode]);
 
   // ── Socket lifecycle ──────────────────────────────────────
   useEffect(() => {
@@ -195,13 +216,15 @@ export function EditorPage() {
 
     const onConnect = () => {
       setConnStatus('connected');
-      console.log('[DEBUG] emitting room:join (on connect), roomId:', roomId, 'userId:', user?.id);
       socket.emit(SocketEvents.JOIN_ROOM, { roomId });
     };
 
     const onReconnect = () => {
+      // ✅ Only show the toast here — JOIN_ROOM is already emitted by onConnect
+      // (socket.io fires 'connect' on every connection including reconnects,
+      // so emitting JOIN_ROOM here too would cause a duplicate join notification
+      // for every other user in the room)
       setConnStatus('connected');
-      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
       toast.success('Reconnected', 'Back in the room.');
     };
 
@@ -210,8 +233,18 @@ export function EditorPage() {
       toast.warning('Disconnected', 'Trying to reconnect…');
     };
 
-    const onRoomState = (state: { code: string; users: ConnectedUser[] }) => {
-      initializeCode(state.code);
+    const onRoomState = (state: { code: string; users: ConnectedUser[]; language?: Language }) => {
+      // ✅ Update language from room:state so new joiners always see the current
+      // language even if someone changed it after the room was first created
+      if (state.language) setLanguage(state.language);
+      
+      // If we are the first user in the room, seed the document with the DB code.
+      // Otherwise, clear any local starter code and wait for active users to sync their current screen.
+      if (state.users.length === 0) {
+        initializeCode(state.code);
+      } else {
+        initializeCode('');
+      }
       setConnectedUsers(state.users);
     };
 
@@ -228,6 +261,12 @@ export function EditorPage() {
     const onCodeUpdate = ({ content, userId: senderId }: { content: string; userId: string }) => {
       if (senderId === user.id) return;
       setCode(content);
+    };
+
+    // ✅ Language changed by another user in the room
+    const onLanguageChanged = ({ language: lang }: { language: Language }) => {
+      setLanguage(lang);
+      toast.info(`Language switched to ${LANGUAGES[lang]?.label ?? lang}`);
     };
 
     const onRunResult = (result: {
@@ -253,32 +292,33 @@ export function EditorPage() {
       toast.error('Socket error', msg);
     };
 
-    socket.on('connect',                    onConnect);
-    socket.on('reconnect',                  onReconnect);
-    socket.on('disconnect',                 onDisconnect);
-    socket.on(SocketEvents.ROOM_STATE,      onRoomState);
-    socket.on(SocketEvents.USER_JOINED,     onUserJoined);
-    socket.on(SocketEvents.USER_LEFT,       onUserLeft);
-    socket.on(SocketEvents.CODE_UPDATE,     onCodeUpdate);
-    socket.on(SocketEvents.RUN_RESULT,      onRunResult);
-    socket.on(SocketEvents.ERROR,           onError);
+    socket.on('connect',                        onConnect);
+    socket.on('reconnect',                      onReconnect);
+    socket.on('disconnect',                     onDisconnect);
+    socket.on(SocketEvents.ROOM_STATE,          onRoomState);
+    socket.on(SocketEvents.USER_JOINED,         onUserJoined);
+    socket.on(SocketEvents.USER_LEFT,           onUserLeft);
+    socket.on(SocketEvents.CODE_UPDATE,         onCodeUpdate);
+    socket.on(SocketEvents.LANGUAGE_CHANGED,    onLanguageChanged);
+    socket.on(SocketEvents.RUN_RESULT,          onRunResult);
+    socket.on(SocketEvents.ERROR,               onError);
 
     setConnStatus(socket.connected ? 'connected' : 'connecting');
     if (socket.connected) {
-      console.log('[DEBUG] emitting room:join (already connected), roomId:', roomId, 'userId:', user?.id);
       socket.emit(SocketEvents.JOIN_ROOM, { roomId });
     }
 
     return () => {
-      socket.off('connect',                    onConnect);
-      socket.off('reconnect',                  onReconnect);
-      socket.off('disconnect',                 onDisconnect);
-      socket.off(SocketEvents.ROOM_STATE,      onRoomState);
-      socket.off(SocketEvents.USER_JOINED,     onUserJoined);
-      socket.off(SocketEvents.USER_LEFT,       onUserLeft);
-      socket.off(SocketEvents.CODE_UPDATE,     onCodeUpdate);
-      socket.off(SocketEvents.RUN_RESULT,      onRunResult);
-      socket.off(SocketEvents.ERROR,           onError);
+      socket.off('connect',                     onConnect);
+      socket.off('reconnect',                   onReconnect);
+      socket.off('disconnect',                  onDisconnect);
+      socket.off(SocketEvents.ROOM_STATE,       onRoomState);
+      socket.off(SocketEvents.USER_JOINED,      onUserJoined);
+      socket.off(SocketEvents.USER_LEFT,        onUserLeft);
+      socket.off(SocketEvents.CODE_UPDATE,      onCodeUpdate);
+      socket.off(SocketEvents.LANGUAGE_CHANGED, onLanguageChanged);
+      socket.off(SocketEvents.RUN_RESULT,       onRunResult);
+      socket.off(SocketEvents.ERROR,            onError);
       socket.emit(SocketEvents.LEAVE_ROOM, { roomId });
     };
   }, [roomId, user?.id]);
@@ -291,7 +331,7 @@ export function EditorPage() {
     setRunStats(null);
     try {
       const { jobId } = await execApi.run(roomId, codeRef.current, language);
-      startPolling(jobId); // poller is fallback; socket RUN_RESULT calls cancelPolling() first
+      startPolling(jobId);
     } catch (err: any) {
       setRunning(false);
       const msg = err?.message ?? 'Failed to queue job.';
@@ -300,7 +340,6 @@ export function EditorPage() {
     }
   }, [running, roomId, language, connStatus, startPolling, toast]);
 
-  // Keep ref current so Monaco Ctrl+Enter is never stale
   handleRunRef.current = handleRun;
 
   // ── Monaco mount ─────────────────────────────────────────
@@ -311,11 +350,10 @@ export function EditorPage() {
     registerMonacoTheme(monaco);
     monaco.editor.setTheme('midnight');
     editor.updateOptions({
-      cursorBlinking: 'phase',
-      smoothScrolling: true,
+      cursorBlinking:             'phase',
+      smoothScrolling:            true,
       cursorSmoothCaretAnimation: 'on',
     });
-    // Ref prevents stale closure — always calls the latest handleRun
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () => handleRunRef.current());
     bindEditor(editor, monaco);
   }, [bindEditor]);
@@ -370,7 +408,17 @@ export function EditorPage() {
               {(Object.entries(LANGUAGES) as [Language, typeof LANGUAGES[Language]][]).map(([key,cfg])=>(
                 <button key={key} className="dropdown-item"
                   style={language===key?{color:'var(--ac-6)'}:{}}
-                  onClick={()=>{ setLanguage(key); setLangOpen(false); toast.info(`Switched to ${cfg.label}`); }}
+                  onClick={()=>{
+                    setLanguage(key);
+                    setLangOpen(false);
+                    
+                    const newStarter = LANGUAGES[key as Language]?.starter ?? '';
+                    setYjsCode(newStarter);
+                    
+                    toast.info(`Switched to ${cfg.label}`);
+                    // ✅ Broadcast language change to everyone else in the room
+                    getSocket()?.emit(SocketEvents.LANGUAGE_CHANGE, { roomId, language: key });
+                  }}
                 >
                   <span>{cfg.icon}</span>{cfg.label}
                 </button>
@@ -384,7 +432,6 @@ export function EditorPage() {
 
         {/* Right */}
         <div className="editor-topbar-right">
-          {/* User avatars */}
           <div className="editor-users">
             {user && (
               <div className="editor-user-avatar" style={{background:colorForUser(user.id)}}>
@@ -409,7 +456,7 @@ export function EditorPage() {
           </div>
 
           <Button variant="secondary" size="sm" icon={<Share2 size={13}/>} onClick={()=>setShareOpen(true)}>
-            Share
+            Share Code
           </Button>
 
           <button className="run-btn" onClick={handleRun} disabled={running||connStatus!=='connected'}>
@@ -451,7 +498,8 @@ export function EditorPage() {
           </div>
         </div>
 
-        {/* Monaco */}
+        {/* Monaco — ✅ uncontrolled (no value prop): Yjs owns the model directly.
+            defaultValue is intentionally empty; initializeCode() seeds the content. */}
         <div className="editor-center">
           <div className="editor-tabs">
             <button className="editor-tab active">
@@ -462,8 +510,8 @@ export function EditorPage() {
             <MonacoEditor
               height="100%"
               language={langCfg.monacoId}
-              value={code}
               theme="midnight"
+              defaultValue=""
               onMount={handleEditorMount}
               options={{
                 fontSize:                   14,

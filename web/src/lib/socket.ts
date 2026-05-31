@@ -25,7 +25,6 @@ export function connectSocket(): Socket {
   return s;
 }
 
-// Called on logout / room exit — forces a fresh token on next connect
 export function disconnectSocket(): void {
   if (socket) {
     socket.removeAllListeners();
@@ -43,23 +42,23 @@ export function offSocket(
   }
 }
 
-// ── Typed event constants ─────────────────────────────────
-// Names match server handlers exactly.
 export const SocketEvents = {
   // Client → Server
-  JOIN_ROOM:     'room:join',
-  LEAVE_ROOM:    'room:leave',
-  CODE_CHANGE:   'code:change',    // plain-text fallback
-  CURSOR_MOVE:   'cursor:move',    // plain cursor fallback
-  YJS_UPDATE:    'yjs:update',     // binary Yjs diff (primary)
-  YJS_AWARENESS: 'yjs:awareness',  // cursor + selection awareness
+  JOIN_ROOM:        'room:join',
+  LEAVE_ROOM:       'room:leave',
+  CODE_CHANGE:      'code:change',
+  CURSOR_MOVE:      'cursor:move',
+  YJS_UPDATE:       'yjs:update',
+  YJS_AWARENESS:    'yjs:awareness',
+  LANGUAGE_CHANGE:  'room:language-change',   // ← new
 
   // Server → Client
-  ROOM_STATE:    'room:state',
-  USER_JOINED:   'room:user-joined',
-  USER_LEFT:     'room:user-left',
-  CODE_UPDATE:   'code:update',
-  CURSOR_UPDATE: 'cursor:update',
-  RUN_RESULT:    'code:run-result',
-  ERROR:         'error',
+  ROOM_STATE:       'room:state',
+  USER_JOINED:      'room:user-joined',
+  USER_LEFT:        'room:user-left',
+  CODE_UPDATE:      'code:update',
+  CURSOR_UPDATE:    'cursor:update',
+  RUN_RESULT:       'code:run-result',
+  LANGUAGE_CHANGED: 'room:language-changed',  // ← new
+  ERROR:            'error',
 } as const;

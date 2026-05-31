@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { roomsApi } from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
+import { useToast } from '../contexts/ToastContext';
 import { Navbar } from '../components/layout/Navbar';
 import { Button } from '../components/ui/Button';
 import { Input } from '../components/ui/Input';
@@ -153,6 +154,54 @@ function CreateRoomModal({ open, onClose, onCreate }: CreateModalProps) {
   );
 }
 
+// ── Join Room Modal ──────────────────────────────────────
+interface JoinModalProps {
+  open: boolean;
+  onClose: () => void;
+}
+
+function JoinRoomModal({ open, onClose }: JoinModalProps) {
+  const [code, setCode]   = useState('');
+  const [error, setError] = useState('');
+  const navigate          = useNavigate();
+
+  const handleClose = () => { setCode(''); setError(''); onClose(); };
+
+  const handleSubmit = () => {
+    const val = code.trim();
+    if (!val) { setError('Room code is required.'); return; }
+    if (!/^[a-zA-Z0-9]{8}$/.test(val)) { setError('Code must be 8 alphanumeric characters.'); return; }
+    handleClose();
+    navigate(`/room/${val.toUpperCase()}`);
+  };
+
+  return (
+    <Modal
+      open={open}
+      onClose={handleClose}
+      title="Join room by code"
+      footer={
+        <>
+          <Button variant="ghost" size="md" onClick={handleClose}>Cancel</Button>
+          <Button variant="primary" size="md" onClick={handleSubmit}>
+            Join room
+          </Button>
+        </>
+      }
+    >
+      {error && <div className="auth-error">{error}</div>}
+      <Input
+        label="Room Code"
+        placeholder="Enter 8-character code (e.g. A4F98E72)"
+        value={code}
+        onChange={(e) => setCode(e.target.value)}
+        autoFocus
+        maxLength={8}
+      />
+    </Modal>
+  );
+}
+
 // ── Room card ─────────────────────────────────────────────
 interface RoomCardProps {
   room: Room;
@@ -162,6 +211,7 @@ interface RoomCardProps {
 
 function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
   const navigate              = useNavigate();
+  const toast                 = useToast();
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef               = useRef<HTMLDivElement>(null);
   const cfg                   = LANGUAGES[room.language];
@@ -175,9 +225,10 @@ function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const copyLink = (e: React.MouseEvent) => {
+  const copyCode = (e: React.MouseEvent) => {
     e.stopPropagation();
-    navigator.clipboard.writeText(`${window.location.origin}/room/${room.id}`);
+    navigator.clipboard.writeText(room.id);
+    toast.success('Room code copied!');
     setMenuOpen(false);
   };
 
@@ -219,8 +270,8 @@ function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
               <button className="dropdown-item" onClick={(e) => { navigate(`/room/${room.id}`); e.stopPropagation(); }}>
                 <ExternalLink size={13} /> Open room
               </button>
-              <button className="dropdown-item" onClick={copyLink}>
-                <Copy size={13} /> Copy link
+              <button className="dropdown-item" onClick={copyCode}>
+                <Copy size={13} /> Copy room code
               </button>
               {isOwner && (
                 <>
@@ -272,6 +323,7 @@ export function DashboardPage() {
   const [loading, setLoading]   = useState(true);
   const [search, setSearch]     = useState('');
   const [creating, setCreating] = useState(false);
+  const [joining, setJoining]   = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -306,14 +358,11 @@ export function DashboardPage() {
     const val = search.trim();
     if (!val) return;
 
-    // Full URL pasted: http(s)://anything/room/<id>
-    const urlMatch = val.match(/\/room\/([a-zA-Z0-9_-]+)/);
-    if (urlMatch) { navigate(`/room/${urlMatch[1]}`); return; }
-
-    // Bare room ID (cuid = 25 chars, uuid = 36)
-    if (/^[a-zA-Z0-9_-]{20,}$/.test(val)) { navigate(`/room/${val}`); return; }
-
-    // Otherwise just filters in place — nothing extra needed
+    // Direct room code join: if 8 chars alphanumeric, navigate to the room
+    if (/^[a-zA-Z0-9]{8}$/.test(val)) {
+      navigate(`/room/${val.toUpperCase()}`);
+      return;
+    }
   }, [search, navigate]);
 
   const filtered = rooms.filter((r) =>
@@ -342,7 +391,7 @@ export function DashboardPage() {
           <div className="dashboard-search">
             <span className="dashboard-search-icon"><Search size={15} /></span>
             <input
-              placeholder="Search rooms or paste a link…"
+              placeholder="Search rooms or enter code…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
@@ -368,6 +417,14 @@ export function DashboardPage() {
             <span className="dashboard-count">{filtered.length}</span>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Users size={15} />}
+              onClick={() => setJoining(true)}
+            >
+              Join by Code
+            </Button>
             <Button
               variant="primary"
               size="sm"
@@ -406,7 +463,7 @@ export function DashboardPage() {
               </div>
               <p className="empty-desc">
                 {search
-                  ? 'Try a different search term, or paste a room link and press Enter.'
+                  ? 'Try a different search term, or enter an 8-character room code.'
                   : 'Create your first room to start collaborating with teammates in real-time.'
                 }
               </p>
@@ -435,6 +492,10 @@ export function DashboardPage() {
         open={creating}
         onClose={() => setCreating(false)}
         onCreate={handleCreate}
+      />
+      <JoinRoomModal
+        open={joining}
+        onClose={() => setJoining(false)}
       />
     </div>
   );

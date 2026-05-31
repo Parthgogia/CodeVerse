@@ -4,7 +4,6 @@ import type * as Monaco from 'monaco-editor';
 import { connectSocket } from './socket';
 import type { User } from '../types';
 
-// ── Types ─────────────────────────────────────────────────
 interface AwarenessState {
   userId:    string;
   username:  string;
@@ -21,7 +20,6 @@ function colorForUser(id: string): string {
   return PALETTE[Math.abs(h) % PALETTE.length];
 }
 
-// Per-user CSS is injected once so Monaco cursor decorations render
 const injectedStyles = new Set<string>();
 function injectCursorCSS(userId: string, color: string): void {
   if (injectedStyles.has(userId)) return;
@@ -55,7 +53,6 @@ function injectCursorCSS(userId: string, color: string): void {
   document.head.appendChild(el);
 }
 
-// ── Hook ──────────────────────────────────────────────────
 interface Options {
   roomId:        string;
   user:          User | null;
@@ -64,10 +61,10 @@ interface Options {
 }
 
 interface YjsEditorReturn {
-  /** Seed the Y.Text with code from room:state BEFORE the editor is bound */
-  initializeCode:  (code: string) => void;
-  bindEditor:      (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
-  unbindEditor:    () => void;
+  initializeCode: (code: string) => void;
+  setCode:        (code: string) => void;
+  bindEditor:     (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
+  unbindEditor:   () => void;
 }
 
 export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): YjsEditorReturn {
@@ -77,10 +74,9 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
   const monacoRef      = useRef<typeof import('monaco-editor') | null>(null);
   const decorationsRef = useRef<Map<string, string[]>>(new Map());
 
-  // Guards to prevent echo loops
-  const suppressYjs    = useRef(false);   // true while applying Monaco edit → don't re-apply to Monaco
-  const suppressMonaco = useRef(false);   // true while applying Yjs update → don't emit back to server
-  const initialized    = useRef(false);   // true once initializeCode() has been called
+  const suppressYjs    = useRef(false);
+  const suppressMonaco = useRef(false);
+  const initialized    = useRef(false);
 
   // ── Create Y.Doc on mount ──────────────────────────────
   useEffect(() => {
@@ -121,20 +117,32 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       clearRemoteCursor(userId);
     };
 
-    socket.on('yjs:update',    onYjsUpdate);
-    socket.on('yjs:awareness', onAwareness);
-    socket.on('room:user-left', onUserLeft);
+    // ✅ When a new user joins, broadcast our full document state so they
+    // immediately receive the current code without needing a keystroke.
+    const onUserJoined = () => {
+      const ydoc = ydocRef.current;
+      if (!ydoc) return;
+      const fullUpdate = Y.encodeStateAsUpdate(ydoc);
+      if (fullUpdate.length > 2) {
+        // Only emit if doc is non-empty (Yjs empty doc is 2 bytes)
+        socket.emit('yjs:update', { roomId, update: Array.from(fullUpdate) });
+      }
+    };
+
+    socket.on('yjs:update',       onYjsUpdate);
+    socket.on('yjs:awareness',    onAwareness);
+    socket.on('room:user-left',   onUserLeft);
+    socket.on('room:user-joined', onUserJoined);
 
     return () => {
-      socket.off('yjs:update',    onYjsUpdate);
-      socket.off('yjs:awareness', onAwareness);
-      socket.off('room:user-left', onUserLeft);
+      socket.off('yjs:update',       onYjsUpdate);
+      socket.off('yjs:awareness',    onAwareness);
+      socket.off('room:user-left',   onUserLeft);
+      socket.off('room:user-joined', onUserJoined);
     };
   }, [enabled, roomId, user?.id]);
 
-  // ── initializeCode — called by EditorPage on room:state ─
-  // Seeds the Y.Text so the first remote Yjs diff is applied correctly.
-  // Must be called before or after bindEditor — both orderings are safe.
+  // ── initializeCode ─────────────────────────────────────
   const initializeCode = useCallback((code: string) => {
     const ytext = ytextRef.current;
     if (!ytext) return;
@@ -142,7 +150,6 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     initialized.current = true;
     suppressYjs.current = true;
     try {
-      // Replace entire Y.Text atomically
       const current = ytext.toString();
       if (current !== code) {
         ytext.delete(0, ytext.length);
@@ -152,7 +159,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       suppressYjs.current = false;
     }
 
-    // If editor is already bound, sync Monaco to match
+    // If editor is already bound, sync Monaco model to match
     const editor = editorRef.current;
     if (editor) {
       const model = editor.getModel();
@@ -165,6 +172,37 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
 
     onCodeChange?.(code);
   }, [onCodeChange]);
+
+  // ── setCode (Programmatic update that broadcasts) ────────
+  const setCode = useCallback((code: string) => {
+    const ytext = ytextRef.current;
+    if (!ytext) return;
+    
+    suppressYjs.current = true;
+    try {
+      ytext.delete(0, ytext.length);
+      if (code) ytext.insert(0, code);
+      
+      const ydoc = ydocRef.current;
+      if (ydoc) {
+        const socket = connectSocket();
+        const update = Y.encodeStateAsUpdate(ydoc);
+        socket.emit('yjs:update', { roomId, update: Array.from(update) });
+      }
+    } finally {
+      suppressYjs.current = false;
+    }
+
+    const editor = editorRef.current;
+    if (editor) {
+      const model = editor.getModel();
+      if (model && model.getValue() !== code) {
+        suppressMonaco.current = true;
+        model.setValue(code);
+        suppressMonaco.current = false;
+      }
+    }
+  }, [roomId]);
 
   // ── Remote cursor rendering ────────────────────────────
   const renderRemoteCursor = useCallback((state: AwarenessState) => {
@@ -182,7 +220,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
           state.cursor.lineNumber, state.cursor.column,
         ),
         options: {
-          className:            `remote-cursor-${state.userId}`,
+          className:              `remote-cursor-${state.userId}`,
           beforeContentClassName: `remote-cursor-label-${state.userId}`,
           stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
           hoverMessage: { value: `**${state.username}**` },
@@ -200,7 +238,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
           state.selection.endLineNumber,   state.selection.endColumn,
         ),
         options: {
-          className: `remote-selection-${state.userId}`,
+          className:  `remote-selection-${state.userId}`,
           stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
         },
       });
@@ -224,8 +262,8 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     editor: Monaco.editor.IStandaloneCodeEditor,
     monaco: typeof import('monaco-editor'),
   ) => {
-    editorRef.current = editor;
-    monacoRef.current = monaco;
+    editorRef.current  = editor;
+    monacoRef.current  = monaco;
 
     if (!enabled || !user) return;
 
@@ -255,6 +293,18 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
 
     ytext.observe(onYjsChange);
 
+    // ✅ Initial sync — if initializeCode was called before the editor mounted,
+    // Y.Text already has content; push it into Monaco now so they're in sync
+    // before the user can type anything.
+    const existingText = ytext.toString();
+    const model        = editor.getModel();
+    if (model && existingText && model.getValue() !== existingText) {
+      suppressMonaco.current = true;
+      model.setValue(existingText);
+      suppressMonaco.current = false;
+      onCodeChange?.(existingText);
+    }
+
     // ── Monaco → Yjs ─────────────────────────────────────
     const disposeChange = editor.onDidChangeModelContent((e) => {
       if (suppressMonaco.current) return;
@@ -263,7 +313,6 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       try {
         const ydoc = ydocRef.current!;
         ydoc.transact(() => {
-          // Apply changes in reverse offset order so offsets stay correct
           const sorted = [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
           for (const ch of sorted) {
             if (ch.rangeLength > 0) ytext.delete(ch.rangeOffset, ch.rangeLength);
@@ -271,7 +320,6 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
           }
         });
 
-        // Broadcast binary Yjs diff
         const update = Y.encodeStateAsUpdate(ydoc);
         socket.emit('yjs:update', { roomId, update: Array.from(update) });
         onCodeChange?.(ytext.toString());
@@ -314,10 +362,9 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       });
     });
 
-    // Stash disposables
     (editor as any).__yjsDisposables = [disposeChange, disposePos, disposeSel];
     (editor as any).__yjsObserver    = onYjsChange;
-  },[enabled, roomId, user?.id, user?.username, onCodeChange]);
+  }, [enabled, roomId, user?.id, user?.username, onCodeChange]);
 
   // ── unbindEditor ───────────────────────────────────────
   const unbindEditor = useCallback(() => {
@@ -338,5 +385,5 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     monacoRef.current = null;
   }, [clearRemoteCursor]);
 
-  return { initializeCode, bindEditor, unbindEditor };
+  return { initializeCode, setCode, bindEditor, unbindEditor };
 }

@@ -3,6 +3,8 @@ import { RoomManager }           from "../realtime/roomManager.js";
 import { checkRateLimit, Limits } from "../realtime/rateLimiter.js";
 import { prisma }                from "../config/db.js";
 
+const VALID_LANGUAGES = new Set(['javascript','typescript','python','cpp','java']);
+
 // ── Helpers ───────────────────────────────────────────────
 async function getLatestCode(roomId: string): Promise<string> {
   const snap = await prisma.snapshot.findFirst({
@@ -20,7 +22,6 @@ export async function handleLeave(
   roomId:          string,
   leaveSocketRoom: boolean,
 ): Promise<void> {
-  // Idempotent — safe even if already removed (e.g. called from disconnect handler)
   RoomManager.leave(socket.id);
 
   if (leaveSocketRoom) socket.leave(roomId);
@@ -38,7 +39,6 @@ export function registerRoomHandlers(io: Server, socket: Socket): void {
 
   // ── room:join ─────────────────────────────────────────
   socket.on("room:join", async ({ roomId }: { roomId: string }) => {
-    // ✅ Wait for attachUserData to finish — username is not set until it resolves
     await socket.data.ready;
     const username: string = socket.data.username as string;
 
@@ -48,7 +48,6 @@ export function registerRoomHandlers(io: Server, socket: Socket): void {
     const ok = await checkRateLimit(userId, "room:join", Limits.JOIN_ROOM);
     if (!ok) { socket.emit("error", "Too many room joins — slow down."); return; }
 
-    // Verify room exists in DB
     const room = await prisma.room.findUnique({ where: { id: roomId } });
     if (!room) { socket.emit("error", "Room not found."); return; }
 
@@ -58,21 +57,23 @@ export function registerRoomHandlers(io: Server, socket: Socket): void {
       await handleLeave(io, socket, userId, username, currentRoom, true);
     }
 
-    // Register in presence map
     const user = RoomManager.join(roomId, { socketId: socket.id, userId, username });
 
-    // Join Socket.IO channel
     socket.join(roomId);
 
-    // Send current code + online users to the joiner
     const code        = await getLatestCode(roomId);
     const onlineUsers = RoomManager.getUsers(roomId)
       .filter((u) => u.socketId !== socket.id)
       .map((u) => ({ id: u.userId, userId: u.userId, username: u.username, color: u.color }));
 
-    socket.emit("room:state", { code, users: onlineUsers });
+    // ✅ Include language so the joining client gets the current language
+    // (may differ from DB default if someone changed it during the session)
+    socket.emit("room:state", {
+      code,
+      users:    onlineUsers,
+      language: room.language,
+    });
 
-    // Announce to everyone else
     socket.to(roomId).emit("room:user-joined", {
       id:       user.userId,
       userId:   user.userId,
@@ -85,12 +86,37 @@ export function registerRoomHandlers(io: Server, socket: Socket): void {
 
   // ── room:leave ─────────────────────────────────────────
   socket.on("room:leave", async ({ roomId }: { roomId: string }) => {
-    // ✅ Same guard — username must be available before leave logic
     await socket.data.ready;
     const username: string = socket.data.username as string;
     await handleLeave(io, socket, userId, username, roomId, true);
   });
 
+  // ── room:language-change ───────────────────────────────
+  socket.on("room:language-change", async ({ roomId, language }: { roomId: string; language: string }) => {
+    await socket.data.ready;
+    const username: string = socket.data.username as string;
+
+    if (!VALID_LANGUAGES.has(language)) {
+      socket.emit("error", "Invalid language.");
+      return;
+    }
+
+    if (!RoomManager.isInRoom(socket.id, roomId)) return;
+
+    // Persist to DB so new joiners always get the current language
+    await prisma.room.update({
+      where: { id: roomId },
+      data:  { language },
+    });
+
+    // ✅ Broadcast to everyone else in the room
+    socket.to(roomId).emit("room:language-changed", { language, changedBy: username });
+
+    console.log(`[room] ${username} changed language to ${language} in ${roomId}`);
+  });
+
   // ── ping / keep-alive ──────────────────────────────────
   socket.on("ping", (cb) => { if (typeof cb === "function") cb(); });
 }
+
+export { handleLeave as default };
