@@ -258,9 +258,12 @@ export function EditorPage() {
       if (username) toast.info(`${username} left`);
     };
 
+    // Apply server-sent code updates into the Yjs document without
+    // re-broadcasting. initializeCode writes into Y.Text with
+    // suppressYjs=true so it won't emit another yjs:update.
     const onCodeUpdate = ({ content, userId: senderId }: { content: string; userId: string }) => {
       if (senderId === user.id) return;
-      setCode(content);
+      initializeCode(content);
     };
 
     // ✅ Language changed by another user in the room

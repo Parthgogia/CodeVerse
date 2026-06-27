@@ -176,7 +176,11 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
   // ── setCode (Programmatic update that broadcasts) ────────
   const setCode = useCallback((code: string) => {
     const ytext = ytextRef.current;
-    if (!ytext) return;
+    // If Y.Text isn't ready, still notify consumer so local state/refs stay current
+    if (!ytext) {
+      onCodeChange?.(code);
+      return;
+    }
     
     suppressYjs.current = true;
     try {
@@ -202,7 +206,10 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
         suppressMonaco.current = false;
       }
     }
-  }, [roomId]);
+
+    // Ensure consumers (e.g. EditorPage) receive the programmatic update
+    onCodeChange?.(code);
+  }, [roomId, onCodeChange]);
 
   // ── Remote cursor rendering ────────────────────────────
   const renderRemoteCursor = useCallback((state: AwarenessState) => {
