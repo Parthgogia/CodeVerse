@@ -1,0 +1,6 @@
+# Local-only AI agent context. Deliberately never committed: it is a working
+# scratchpad of current state, known breakage and environment quirks, and it
+# goes stale the moment it is shared. ARCHITECTURE.md is the committed,
+# durable companion to it.
+agents.md
+AGENTS.md
