@@ -818,8 +818,19 @@ a { color: inherit; text-decoration: none; }
 .room-card-meta { display:flex; align-items:center; gap:12px; font-size:12px; color:var(--tx-3); }
 .room-card-stat { display:flex; align-items:center; gap:4px; }
 .live-dot { width:6px; height:6px; border-radius:50%; background:var(--green); box-shadow:0 0 6px var(--green); animation:pulse-dot 2s ease infinite; }
-.room-card-menu { opacity:0; transition:opacity var(--dur-fast); position:relative; }
+/* Card actions stay legible without hovering — hover-only controls are
+   invisible on touch devices and easy to miss with a mouse. */
+.room-card-actions { display:flex; align-items:center; gap:2px; position:relative; z-index:2; }
+.room-card-menu { opacity:.7; transition:opacity var(--dur-fast); position:relative; }
 .room-card:hover .room-card-menu { opacity:1; }
+
+/* Reads clearly at rest — this is the control people go looking for — but only
+   turns red on hover so it never shouts at you from every card. */
+.room-card-delete {
+  opacity:1; color:var(--tx-2);
+  transition:color var(--dur-fast), background var(--dur-fast);
+}
+.room-card-delete:hover { color:var(--red); background:var(--red-dim); }
 
 .empty-state {
   grid-column:1/-1;

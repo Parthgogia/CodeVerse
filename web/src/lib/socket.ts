@@ -60,5 +60,6 @@ export const SocketEvents = {
   CURSOR_UPDATE:    'cursor:update',
   RUN_RESULT:       'code:run-result',
   LANGUAGE_CHANGED: 'room:language-changed',  // ← new
+  ROOM_DELETED:     'room:deleted',           // owner removed the room
   ERROR:            'error',
 } as const;

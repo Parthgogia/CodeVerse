@@ -1,11 +1,14 @@
 import { Server } from "socket.io";
 import jwt from "jsonwebtoken";
-import { PrismaClient } from "@prisma/client";
-import { registerRoomHandlers, handleLeave } from "../handlers/room.handlers.js";
+import { createAdapter } from "@socket.io/redis-adapter";
+import { registerRoomHandlers, handleLeave, serializeRoomOp } from "../handlers/room.handlers.js";
 import { registerCodeHandlers } from "../handlers/code.handlers.js";
 import { registerCursorHandlers } from "../handlers/cursor.handlers.js";
-import { RoomManager } from "./roomManager.js";
-const prisma = new PrismaClient();
+import { RoomManager, INSTANCE_ID } from "./roomManager.js";
+import { setIo } from "./ioRegistry.js";
+import { ROOM_PURGED, purgeRoomLocally } from "./roomPurge.js";
+import { createRedisClient } from "../config/redis.js";
+import { prisma } from "../config/db.js";
 // ── Socket.IO auth middleware ─────────────────────────────
 function socketAuthMiddleware(socket, next) {
     const token = socket.handshake.auth?.token;
@@ -33,6 +36,11 @@ async function attachUserData(socket) {
         return false;
     }
 }
+// Redis pub/sub pair backing the adapter — kept module-level so shutdown can
+// close them. A client in subscriber mode can't issue normal commands, hence
+// two dedicated connections rather than reusing the shared singleton.
+let pubClient = null;
+let subClient = null;
 // ── Factory ───────────────────────────────────────────────
 export function createSocketServer(httpServer) {
     const io = new Server(httpServer, {
@@ -42,34 +50,72 @@ export function createSocketServer(httpServer) {
         },
         pingTimeout: 20_000,
         pingInterval: 10_000,
-        maxHttpBufferSize: 5 * 1024 * 1024, // 5 MB — for Yjs binary payloads
+        maxHttpBufferSize: 5 * 1024 * 1024,
+    });
+    // ── Horizontal scaling ──────────────────────────────────
+    // Without this, io.to(room).emit() only reaches sockets attached to THIS
+    // process — so with two instances behind a load balancer, half the room
+    // never sees an edit, a cursor, or a run result. The adapter fans every
+    // room broadcast out over Redis pub/sub to all instances. It also makes the
+    // BullMQ worker's io.to(roomId).emit("code:run-result") land in the room no
+    // matter which instance picked the job up.
+    pubClient = createRedisClient();
+    subClient = createRedisClient();
+    io.adapter(createAdapter(pubClient, subClient));
+    pubClient.on("error", (err) => console.error("[socket] Redis pub error:", err?.message));
+    subClient.on("error", (err) => console.error("[socket] Redis sub error:", err?.message));
+    // Presence rosters live in Redis too; the heartbeat lets other instances
+    // tell a live process from one that died with users still "in" a room.
+    void RoomManager.startHeartbeat();
+    console.log(`[socket] Instance ${INSTANCE_ID} — Redis adapter attached`);
+    // Published so REST controllers can broadcast (room deletion, mainly).
+    setIo(io);
+    // Another instance deleted a room — drop everything we still hold for it.
+    io.on(ROOM_PURGED, (roomId) => {
+        purgeRoomLocally(roomId);
+        console.log(`[socket] Purged local state for deleted room ${roomId}`);
     });
     io.use(socketAuthMiddleware);
-    io.on("connection", async (socket) => {
-        const ok = await attachUserData(socket);
-        if (!ok) {
-            socket.emit("error", "User not found");
-            socket.disconnect(true);
-            return;
-        }
-        const userId = socket.data.userId;
-        const username = socket.data.username;
-        console.log(`[socket] +CONNECT  ${username} (${userId}) [${socket.id}]`);
-        // Register domain handlers
+    // ✅ NOT async — handlers registered synchronously so no events are dropped
+    io.on("connection", (socket) => {
+        // ✅ Register all handlers synchronously before any await
         registerRoomHandlers(io, socket);
         registerCodeHandlers(io, socket);
         registerCursorHandlers(io, socket);
+        // ✅ Store the promise — handlers await this before reading username
+        socket.data.ready = attachUserData(socket).then((ok) => {
+            if (!ok) {
+                socket.emit("error", "User not found");
+                socket.disconnect(true);
+                return;
+            }
+            console.log(`[socket] +CONNECT  ${socket.data.username} (${socket.data.userId}) [${socket.id}]`);
+        });
         // ── Disconnect — single authoritative cleanup ─────────
-        socket.on("disconnect", async (reason) => {
+        // Queued behind any in-flight join/leave for this socket, so a disconnect
+        // can never overtake the join it is meant to undo.
+        socket.on("disconnect", (reason) => serializeRoomOp(socket, async () => {
+            // Wait for username to be available before cleanup
+            await socket.data.ready;
+            const userId = socket.data.userId;
+            const username = socket.data.username;
             console.log(`[socket] -DISCONNECT ${username} (${userId}) — ${reason}`);
-            // Look up which room this socket was in BEFORE removing from presence map
             const roomId = RoomManager.getRoomForSocket(socket.id);
             if (roomId) {
-                // handleLeave removes from RoomManager, emits room:user-left
                 await handleLeave(io, socket, userId, username, roomId, false);
             }
-        });
+        }));
     });
     return io;
+}
+// ── Shutdown ──────────────────────────────────────────────
+/** Drop this instance's presence entries and close its Redis connections. */
+export async function closeSocketServer(io) {
+    await RoomManager.shutdown();
+    await new Promise((resolve) => io.close(() => resolve()));
+    pubClient?.disconnect();
+    subClient?.disconnect();
+    pubClient = null;
+    subClient = null;
 }
 //# sourceMappingURL=socket.js.map

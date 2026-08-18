@@ -61,10 +61,11 @@ interface Options {
 }
 
 interface YjsEditorReturn {
-  initializeCode: (code: string) => void;
-  setCode:        (code: string) => void;
-  bindEditor:     (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
-  unbindEditor:   () => void;
+  initializeCode:   (code: string) => void;
+  setCode:          (code: string) => void;
+  applyServerState: (update: number[]) => void;
+  bindEditor:       (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
+  unbindEditor:     () => void;
 }
 
 export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): YjsEditorReturn {
@@ -171,6 +172,31 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     }
 
     onCodeChange?.(code);
+  }, [onCodeChange]);
+
+  // ── applyServerState ───────────────────────────────────
+  // Restores the room's saved document. The server sends the Yjs state as
+  // bytes rather than text on purpose: applying the identical CRDT operations
+  // reproduces the document exactly, whereas re-typing the text as a fresh
+  // insert would duplicate content the moment it merged with anyone else's copy.
+  const applyServerState = useCallback((update: number[]) => {
+    const ydoc = ydocRef.current;
+    // An empty Y.Doc encodes to 2 bytes — nothing to restore.
+    if (!ydoc || !update || update.length <= 2) return;
+
+    initialized.current    = true;
+    suppressMonaco.current = true;
+    try {
+      Y.applyUpdate(ydoc, new Uint8Array(update));
+    } finally {
+      suppressMonaco.current = false;
+    }
+
+    // If the editor is already mounted the Y.Text observer has synced Monaco
+    // for us; if not, bindEditor's initial sync will. Either way, make sure the
+    // consumer's copy of the code is current.
+    const text = ytextRef.current?.toString() ?? '';
+    onCodeChange?.(text);
   }, [onCodeChange]);
 
   // ── setCode (Programmatic update that broadcasts) ────────
@@ -392,5 +418,5 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     monacoRef.current = null;
   }, [clearRemoteCursor]);
 
-  return { initializeCode, setCode, bindEditor, unbindEditor };
+  return { initializeCode, setCode, applyServerState, bindEditor, unbindEditor };
 }

@@ -19,7 +19,8 @@ if (missing.length) {
 import authRoutes from "./routes/auth.routes.js";
 import roomRoutes from "./routes/room.routes.js";
 import execRoutes from "./routes/exec.routes.js";
-import { createSocketServer } from "./realtime/socket.js";
+import { createSocketServer, closeSocketServer } from "./realtime/socket.js";
+import { RoomDocs }            from "./realtime/roomDocs.js";
 import { startExecWorker }    from "./queues/execQueue.js";
 import { prisma }             from "./config/db.js";
 
@@ -77,15 +78,36 @@ httpServer.listen(PORT, () => {
 });
 
 // ── Graceful shutdown ─────────────────────────────────────
+let shuttingDown = false;
+
 async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`\n${signal} received — shutting down gracefully`);
-  httpServer.close(async () => {
+
+  // Force exit after 10 s if something hangs
+  const force = setTimeout(() => {
+    console.error("Forced exit after timeout");
+    process.exit(1);
+  }, 10_000);
+  force.unref?.();
+
+  try {
+    // Closes Socket.IO (and with it the HTTP server), drops this instance's
+    // presence entries from Redis so other instances don't count ghosts, and
+    // releases the adapter's pub/sub connections.
+    await closeSocketServer(io);
+    // Sockets are gone, so no further edits can arrive — write every open
+    // document out before the DB connection closes. Without this, edits made
+    // inside the last save-debounce window would be lost on restart.
+    await RoomDocs.flushAll();
     await prisma.$disconnect();
     console.log("Shutdown complete.");
     process.exit(0);
-  });
-  // Force exit after 10 s if something hangs
-  setTimeout(() => { console.error("Forced exit after timeout"); process.exit(1); }, 10_000);
+  } catch (err) {
+    console.error("[server] Shutdown error:", err);
+    process.exit(1);
+  }
 }
 
 process.on("SIGTERM", () => shutdown("SIGTERM"));

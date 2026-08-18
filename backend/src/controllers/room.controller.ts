@@ -2,11 +2,15 @@ import type { Response } from "express";
 import { PrismaClient }   from "@prisma/client";
 import type { AuthRequest } from "../middleware/auth.middleware.js";
 import { RoomManager }    from "../realtime/roomManager.js";
+import { resolveRoomAccess } from "../services/roomAccess.js";
+import { purgeRoomEverywhere } from "../realtime/roomPurge.js";
 
 const prisma = new PrismaClient();
 
 // ── Map DB room → response shape expected by frontend ─────
-function mapRoom(room: any) {
+// activeUsers now comes from the shared Redis roster, so the count reflects
+// everyone in the room across all backend instances — not just this process.
+async function mapRoom(room: any) {
   return {
     id:          room.id,
     name:        room.name,
@@ -16,7 +20,7 @@ function mapRoom(room: any) {
     ownerId:     room.ownerId,
     createdAt:   room.createdAt,
     updatedAt:   room.updatedAt,
-    activeUsers: RoomManager.getUserCount(room.id),
+    activeUsers: await RoomManager.getUserCount(room.id),
   };
 }
 
@@ -61,7 +65,7 @@ export const createRoom = async (req: AuthRequest, res: Response) => {
       },
     });
 
-    return res.status(201).json(mapRoom(room));
+    return res.status(201).json(await mapRoom(room));
   } catch (err) {
     console.error("[room] createRoom error:", err);
     return res.status(500).json({ message: "Failed to create room" });
@@ -75,7 +79,7 @@ export const getRooms = async (req: AuthRequest, res: Response) => {
       where:   { ownerId: req.userId! },
       orderBy: { updatedAt: "desc" },
     });
-    return res.json(rooms.map(mapRoom));
+    return res.json(await Promise.all(rooms.map(mapRoom)));
   } catch (err) {
     console.error("[room] getRooms error:", err);
     return res.status(500).json({ message: "Failed to fetch rooms" });
@@ -88,9 +92,11 @@ export const getRoom = async (req: AuthRequest, res: Response) => {
   if (!roomId) return res.status(400).json({ message: "Room id is required" });
 
   try {
-    const room = await prisma.room.findUnique({ where: { id: roomId } });
-    if (!room) return res.status(404).json({ message: "Room not found" });
-    return res.json(mapRoom(room));
+    // Private rooms are owner-only — see services/roomAccess.ts
+    const access = await resolveRoomAccess(roomId, req.userId);
+    if (!access.ok) return res.status(access.status).json({ message: access.message });
+
+    return res.json(await mapRoom(access.room));
   } catch (err) {
     console.error("[room] getRoom error:", err);
     return res.status(500).json({ message: "Failed to fetch room" });
@@ -119,7 +125,7 @@ export const updateRoom = async (req: AuthRequest, res: Response) => {
       },
     });
 
-    return res.json(mapRoom(updated));
+    return res.json(await mapRoom(updated));
   } catch (err) {
     console.error("[room] updateRoom error:", err);
     return res.status(500).json({ message: "Failed to update room" });
@@ -139,6 +145,11 @@ export const deleteRoom = async (req: AuthRequest, res: Response) => {
     // Cascade delete snapshots (handled by Prisma schema onDelete: Cascade)
     await prisma.room.delete({ where: { id: roomId } });
 
+    // Anyone still editing gets told the room is gone and is shown out, and
+    // every instance drops its cached document and presence for it — otherwise
+    // they would sit in a room that no longer exists, typing into nothing.
+    await purgeRoomEverywhere(roomId, room.name);
+
     return res.status(204).send();
   } catch (err) {
     console.error("[room] deleteRoom error:", err);
@@ -153,8 +164,9 @@ export const getRoomSnapshots = async (req: AuthRequest, res: Response) => {
   if (!roomId) return res.status(400).json({ message: "Room id is required" });
 
   try {
-    const room = await prisma.room.findUnique({ where: { id: roomId } });
-    if (!room) return res.status(404).json({ message: "Room not found" });
+    // Snapshots are the room's full source history — same access rules as the room
+    const access = await resolveRoomAccess(roomId, req.userId);
+    if (!access.ok) return res.status(access.status).json({ message: access.message });
 
     const snapshots = await prisma.snapshot.findMany({
       where:   { roomId },

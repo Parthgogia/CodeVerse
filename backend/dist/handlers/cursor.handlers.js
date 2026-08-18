@@ -1,26 +1,28 @@
 import { RoomManager } from "../realtime/roomManager.js";
 import { checkRateLimit, Limits } from "../realtime/rateLimiter.js";
-export function registerCursorHandlers(io, socket) {
+export function registerCursorHandlers(_io, socket) {
     const userId = socket.data.userId;
-    const username = socket.data.username;
     // ── yjs:awareness ─────────────────────────────────────
-    // Cursor position + selection awareness (from useYjsEditor hook)
     socket.on("yjs:awareness", async ({ roomId, state }) => {
+        // ✅ username may still be undefined if this fires before attachUserData
+        await socket.data.ready;
+        const username = socket.data.username;
         if (!RoomManager.isInRoom(socket.id, roomId))
             return;
         const ok = await checkRateLimit(userId, "cursor:move", Limits.CURSOR_MOVE);
         if (!ok)
-            return; // silently drop cursor events when rate-limited
-        // Forward to everyone else in the room
+            return;
         socket.to(roomId).emit("yjs:awareness", {
             ...state,
-            userId, // always trust server-side userId
-            username, // always trust server-side username
+            userId,
+            username,
         });
     });
     // ── cursor:move ───────────────────────────────────────
-    // Legacy / simple cursor move event (non-Yjs fallback)
     socket.on("cursor:move", async ({ roomId, position }) => {
+        // ✅ Same guard
+        await socket.data.ready;
+        const username = socket.data.username;
         if (!RoomManager.isInRoom(socket.id, roomId))
             return;
         const ok = await checkRateLimit(userId, "cursor:move", Limits.CURSOR_MOVE);

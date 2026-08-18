@@ -27,6 +27,12 @@ model Room {
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   snapshots   Snapshot[]
+
+  // Authoritative Yjs document state (a binary CRDT update, not text).
+  // Every backend instance rebuilds the room's Y.Doc from exactly these bytes,
+  // so their documents merge cleanly instead of duplicating each other's text —
+  // which is what seeding separate docs from a plain string would do.
+  docState    Bytes?
 }
 
 model Snapshot {

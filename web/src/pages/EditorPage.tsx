@@ -5,6 +5,7 @@ import type * as Monaco            from 'monaco-editor';
 import {
   Play, Share2, Copy, ChevronDown, ArrowLeft,
   X, Terminal, Users, Info, Loader2, Globe, Lock,
+  MoreVertical, Trash2, AlertTriangle,
 } from 'lucide-react';
 
 import { roomsApi, execApi }           from '../lib/api';
@@ -167,14 +168,44 @@ export function EditorPage() {
   const [running, setRunning]               = useState(false);
   const [shareOpen, setShareOpen]           = useState(false);
   const [langOpen, setLangOpen]             = useState(false);
+  const [menuOpen, setMenuOpen]             = useState(false);
+  const [deleteOpen, setDeleteOpen]         = useState(false);
+  const [deleting, setDeleting]             = useState(false);
   const langRef                             = useRef<HTMLDivElement>(null);
+  const menuRef                             = useRef<HTMLDivElement>(null);
+  // Set while we are the one deleting, so we don't also toast our own
+  // room:deleted broadcast on the way out.
+  const deletedByMeRef                      = useRef(false);
   const codeRef    = useRef(code);
   codeRef.current  = code;
+
+  // Which room this socket connection has actually joined (null = not joined).
+  // Guards against emitting room:join twice, which is what made everyone else
+  // see the same person "join" two or three times.
+  const joinedRoomRef = useRef<string | null>(null);
+  // The room whose metadata we fetched, and the room the server confirmed we
+  // may open. The socket join waits for the latter, so an unauthorized room
+  // produces exactly one refusal (the HTTP one) instead of two.
+  const fetchedRoomRef = useRef<string | null>(null);
+  const allowedRoomRef = useRef<string | null>(null);
+  // Set by the socket effect; called from the loader once access is confirmed.
+  const joinRoomRef    = useRef<() => void>(() => {});
+  // A leave scheduled by effect cleanup, cancellable if the effect immediately
+  // re-runs (React StrictMode double-invokes effects in development).
+  const leaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Mirror of connectedUsers for event handlers — lets us decide whether an
+  // arrival is genuinely new without putting side effects in a state updater.
+  const usersRef      = useRef<ConnectedUser[]>([]);
+
+  const setUsers = useCallback((next: ConnectedUser[]) => {
+    usersRef.current = next;
+    setConnectedUsers(next);
+  }, []);
 
   const handleRunRef = useRef<() => void>(() => {});
 
   // ── Yjs CRDT ─────────────────────────────────────────────
-  const { initializeCode, setCode: setYjsCode, bindEditor, unbindEditor } = useYjsEditor({
+  const { initializeCode, setCode: setYjsCode, applyServerState, bindEditor, unbindEditor } = useYjsEditor({
     roomId:       roomId ?? '',
     user,
     enabled:      !!roomId && !!user,
@@ -192,21 +223,36 @@ export function EditorPage() {
   // ── Load room metadata ────────────────────────────────────
   useEffect(() => {
     if (!roomId) return;
+
+    // Fetch once per room. Without this React's development double-mount sends
+    // the request twice, and a room you can't open reports the same refusal
+    // twice over.
+    if (fetchedRoomRef.current === roomId) return;
+    fetchedRoomRef.current = roomId;
+
     roomsApi.get(roomId)
       .then((r) => {
         setRoom(r);
         setLanguage(r.language as Language);
 
-        // ✅ Seed Y.Text with starter code immediately so Y.Text and Monaco
-        // model are always in sync before the user can type anything.
-        // room:state will overwrite this with the real server code shortly after.
-        const starter = LANGUAGES[r.language as Language]?.starter ?? '';
-        setCode(starter);
-        initializeCode(starter);
-
+        // Deliberately does NOT seed starter code here. The room's saved
+        // document arrives moments later in room:state, and pre-filling the
+        // Y.Doc first would merge with it — leaving the starter template
+        // duplicated above the user's real code.
         setLoading(false);
+
+        // Authorized — now, and only now, is it worth joining over the socket.
+        allowedRoomRef.current = roomId;
+        joinRoomRef.current();
       })
-      .catch(() => navigate('/dashboard'));
+      .catch((err: any) => {
+        // 403 for a private room you don't own, 404 for a bad code — either
+        // way there is nothing to render, so say why once and go back. The
+        // socket never attempts a join, so the server has no reason to send a
+        // second refusal.
+        toast.error("Can't open room", err?.message ?? 'Room unavailable.');
+        navigate('/dashboard');
+      });
   }, [roomId, navigate, initializeCode]);
 
   // ── Socket lifecycle ──────────────────────────────────────
@@ -214,9 +260,32 @@ export function EditorPage() {
     if (!roomId || !user) return;
     const socket = connectSocket();
 
+    // Cancel a leave queued by the previous cleanup. In development React
+    // mounts, unmounts and remounts every component once, so without this the
+    // sequence the server sees is join → leave → join, and everyone else in the
+    // room watches us "leave" and "join" again for no reason.
+    if (leaveTimerRef.current) {
+      clearTimeout(leaveTimerRef.current);
+      leaveTimerRef.current = null;
+    }
+
+    // Idempotent, and never speculative: we only ask to join a room the API has
+    // already confirmed we may open, so no amount of re-running this effect can
+    // produce a second join broadcast or a duplicate refusal.
+    const joinRoom = () => {
+      if (allowedRoomRef.current !== roomId) return;
+      if (!socket.connected) return;
+      if (joinedRoomRef.current === roomId) return;
+      joinedRoomRef.current = roomId;
+      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
+    };
+    joinRoomRef.current = joinRoom;
+
     const onConnect = () => {
       setConnStatus('connected');
-      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
+      // A new connection means the server has no membership for us any more.
+      joinedRoomRef.current = null;
+      joinRoom();
     };
 
     const onReconnect = () => {
@@ -230,31 +299,50 @@ export function EditorPage() {
 
     const onDisconnect = () => {
       setConnStatus('disconnected');
+      joinedRoomRef.current = null;
       toast.warning('Disconnected', 'Trying to reconnect…');
     };
 
-    const onRoomState = (state: { code: string; users: ConnectedUser[]; language?: Language }) => {
+    const onRoomState = (state: {
+      code: string; doc?: number[]; users: ConnectedUser[]; language?: Language;
+    }) => {
       // ✅ Update language from room:state so new joiners always see the current
       // language even if someone changed it after the room was first created
       if (state.language) setLanguage(state.language);
-      
-      // If we are the first user in the room, seed the document with the DB code.
-      // Otherwise, clear any local starter code and wait for active users to sync their current screen.
-      if (state.users.length === 0) {
-        initializeCode(state.code);
-      } else {
-        initializeCode('');
+
+      if (state.doc && state.doc.length > 2) {
+        // The room has saved work — restore it from the server's CRDT state.
+        // This is what makes a room survive everyone leaving.
+        applyServerState(state.doc);
+      } else if (state.users.length === 0) {
+        // Genuinely empty room and nobody else is here: lay down the starter
+        // template and push it up, so the room has content from the outset.
+        const lang    = state.language ?? language;
+        const starter = LANGUAGES[lang]?.starter ?? '';
+        if (starter) setYjsCode(starter);
       }
-      setConnectedUsers(state.users);
+      // Otherwise: empty room but others are present — they'll push their state
+      // on our arrival, so leave the document alone rather than racing them.
+
+      setUsers(state.users);
     };
 
+    // Fires once per arriving *connection*. Someone already in our roster is
+    // opening a second tab (or re-syncing), not arriving — so update the list
+    // but stay quiet, otherwise the room fills with repeat "X joined" toasts.
     const onUserJoined = (u: ConnectedUser) => {
-      setConnectedUsers((p) => p.find((x) => x.id === u.id) ? p : [...p, u]);
+      if (u.id === user.id) return;
+      if (usersRef.current.some((x) => x.id === u.id)) return;
+      setUsers([...usersRef.current, u]);
       toast.info(`${u.username} joined`);
     };
 
+    // The server only sends this once a person has no connections left in the
+    // room, so it always means a real departure — but ignore it for someone we
+    // never had, so a stray leave can't announce a phantom exit.
     const onUserLeft = ({ userId, username }: { userId: string; username?: string }) => {
-      setConnectedUsers((p) => p.filter((u) => u.id !== userId));
+      if (!usersRef.current.some((u) => u.id === userId)) return;
+      setUsers(usersRef.current.filter((u) => u.id !== userId));
       if (username) toast.info(`${username} left`);
     };
 
@@ -289,6 +377,15 @@ export function EditorPage() {
         toast.error('Run failed', `Exit code ${result.exitCode}`);
     };
 
+    // The owner deleted the room out from under us — there is nothing left to
+    // edit, so say so and leave rather than typing into a room that is gone.
+    const onRoomDeleted = ({ name }: { roomId: string; name?: string }) => {
+      if (deletedByMeRef.current) return;   // we already reported our own delete
+      joinedRoomRef.current = null;
+      toast.warning('Room deleted', `${name ? `"${name}"` : 'This room'} was deleted by its owner.`);
+      navigate('/dashboard');
+    };
+
     const onError = (msg: string) => {
       cancelPolling();
       setRunning(false);
@@ -304,12 +401,11 @@ export function EditorPage() {
     socket.on(SocketEvents.CODE_UPDATE,         onCodeUpdate);
     socket.on(SocketEvents.LANGUAGE_CHANGED,    onLanguageChanged);
     socket.on(SocketEvents.RUN_RESULT,          onRunResult);
+    socket.on(SocketEvents.ROOM_DELETED,        onRoomDeleted);
     socket.on(SocketEvents.ERROR,               onError);
 
     setConnStatus(socket.connected ? 'connected' : 'connecting');
-    if (socket.connected) {
-      socket.emit(SocketEvents.JOIN_ROOM, { roomId });
-    }
+    if (socket.connected) joinRoom();
 
     return () => {
       socket.off('connect',                     onConnect);
@@ -321,8 +417,19 @@ export function EditorPage() {
       socket.off(SocketEvents.CODE_UPDATE,      onCodeUpdate);
       socket.off(SocketEvents.LANGUAGE_CHANGED, onLanguageChanged);
       socket.off(SocketEvents.RUN_RESULT,       onRunResult);
+      socket.off(SocketEvents.ROOM_DELETED,     onRoomDeleted);
       socket.off(SocketEvents.ERROR,            onError);
-      socket.emit(SocketEvents.LEAVE_ROOM, { roomId });
+
+      // Leave on the next tick rather than immediately: if this cleanup is just
+      // React re-running the effect, the new setup cancels this timer and our
+      // membership survives untouched. Only a real unmount lets it through.
+      leaveTimerRef.current = setTimeout(() => {
+        leaveTimerRef.current = null;
+        const joined = joinedRoomRef.current;
+        if (!joined) return;
+        joinedRoomRef.current = null;
+        socket.emit(SocketEvents.LEAVE_ROOM, { roomId: joined });
+      }, 0);
     };
   }, [roomId, user?.id]);
 
@@ -345,6 +452,27 @@ export function EditorPage() {
 
   handleRunRef.current = handleRun;
 
+  // ── Delete room (owner only) ──────────────────────────────
+  const isOwner = !!room && !!user && room.ownerId === user.id;
+
+  const handleDeleteRoom = useCallback(async () => {
+    if (!roomId || deleting) return;
+    setDeleting(true);
+    deletedByMeRef.current = true;
+    try {
+      await roomsApi.delete(roomId);
+      // The server shows everyone else out; we just leave.
+      joinedRoomRef.current = null;
+      toast.success('Room deleted', `"${room?.name ?? roomId}" and its history are gone.`);
+      navigate('/dashboard');
+    } catch (err: any) {
+      deletedByMeRef.current = false;
+      setDeleting(false);
+      setDeleteOpen(false);
+      toast.error('Delete failed', err?.message ?? 'Could not delete this room.');
+    }
+  }, [roomId, deleting, room?.name, navigate, toast]);
+
   // ── Monaco mount ─────────────────────────────────────────
   const handleEditorMount = useCallback((
     editor: Monaco.editor.IStandaloneCodeEditor,
@@ -361,10 +489,11 @@ export function EditorPage() {
     bindEditor(editor, monaco);
   }, [bindEditor]);
 
-  // ── Lang dropdown close on outside click ──────────────────
+  // ── Dropdowns close on outside click ──────────────────────
   useEffect(() => {
     const h = (e: MouseEvent) => {
       if (langRef.current && !langRef.current.contains(e.target as Node)) setLangOpen(false);
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
     };
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
@@ -465,6 +594,30 @@ export function EditorPage() {
           <button className="run-btn" onClick={handleRun} disabled={running||connStatus!=='connected'}>
             {running ? <><div className="run-btn-spinner"/>Running…</> : <><Play size={13} fill="white"/>Run</>}
           </button>
+
+          {/* Room menu — owner-only actions */}
+          {isOwner && (
+            <div ref={menuRef} style={{position:'relative'}}>
+              <button
+                className="btn btn-ghost btn-icon"
+                onClick={()=>setMenuOpen((v)=>!v)}
+                title="Room settings"
+                style={{color:'var(--tx-3)'}}
+              >
+                <MoreVertical size={16}/>
+              </button>
+              {menuOpen && (
+                <div className="dropdown" style={{right:0,top:'calc(100% + 8px)',minWidth:180}}>
+                  <button
+                    className="dropdown-item danger"
+                    onClick={()=>{ setMenuOpen(false); setDeleteOpen(true); }}
+                  >
+                    <Trash2 size={13}/> Delete room
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -566,6 +719,46 @@ export function EditorPage() {
       </div>
 
       <ShareModal roomId={roomId!} open={shareOpen} onClose={()=>setShareOpen(false)}/>
+
+      <Modal
+        open={deleteOpen}
+        onClose={()=>{ if (!deleting) setDeleteOpen(false); }}
+        title="Delete this room?"
+        footer={
+          <>
+            <Button variant="ghost" size="md" onClick={()=>setDeleteOpen(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              size="md"
+              loading={deleting}
+              icon={<Trash2 size={14}/>}
+              onClick={handleDeleteRoom}
+            >
+              Delete room
+            </Button>
+          </>
+        }
+      >
+        <div style={{display:'flex',gap:12,alignItems:'flex-start'}}>
+          <div style={{
+            flexShrink:0, width:34, height:34, borderRadius:'var(--r-md)',
+            background:'var(--red-dim)', color:'var(--red)',
+            display:'flex', alignItems:'center', justifyContent:'center',
+          }}>
+            <AlertTriangle size={17}/>
+          </div>
+          <div style={{fontSize:14,color:'var(--tx-2)',lineHeight:1.6}}>
+            <strong style={{color:'var(--tx-1)'}}>{room?.name}</strong> and its saved
+            code history will be permanently deleted. Anyone still in the room will be
+            sent back to their dashboard.
+            <div style={{marginTop:10,fontSize:13,color:'var(--tx-3)'}}>
+              This can't be undone.
+            </div>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

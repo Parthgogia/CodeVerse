@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Plus, Search, Users, Clock, Globe, Lock,
-  MoreVertical, Trash2, ExternalLink, Code2, Copy,
+  MoreVertical, Trash2, ExternalLink, Code2, Copy, AlertTriangle,
 } from 'lucide-react';
 import { roomsApi } from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -206,7 +206,7 @@ function JoinRoomModal({ open, onClose }: JoinModalProps) {
 interface RoomCardProps {
   room: Room;
   isOwner: boolean;
-  onDelete: (id: string) => void;
+  onDelete: (room: Room) => void;
 }
 
 function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
@@ -235,7 +235,7 @@ function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
   const handleDelete = (e: React.MouseEvent) => {
     e.stopPropagation();
     setMenuOpen(false);
-    onDelete(room.id);
+    onDelete(room);
   };
 
   return (
@@ -256,33 +256,50 @@ function RoomCard({ room, isOwner, onDelete }: RoomCardProps) {
           </div>
         </div>
 
-        {/* Menu */}
-        <div ref={menuRef} className="room-card-menu" onClick={(e) => e.stopPropagation()}>
-          <button
-            className="btn btn-ghost btn-icon"
-            onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
-            style={{ color: 'var(--tx-3)' }}
-          >
-            <MoreVertical size={15} />
-          </button>
-          {menuOpen && (
-            <div className="dropdown">
-              <button className="dropdown-item" onClick={(e) => { navigate(`/room/${room.id}`); e.stopPropagation(); }}>
-                <ExternalLink size={13} /> Open room
-              </button>
-              <button className="dropdown-item" onClick={copyCode}>
-                <Copy size={13} /> Copy room code
-              </button>
-              {isOwner && (
-                <>
-                  <div style={{ height: 1, background: 'var(--bd-dim)', margin: '4px 0' }} />
-                  <button className="dropdown-item danger" onClick={handleDelete}>
-                    <Trash2 size={13} /> Delete room
-                  </button>
-                </>
-              )}
-            </div>
+        {/* Actions */}
+        <div className="room-card-actions" onClick={(e) => e.stopPropagation()}>
+          {/* Owners get delete as its own button — it used to be buried in the
+              menu below, which only appeared on hover. */}
+          {isOwner && (
+            <button
+              className="btn btn-ghost btn-icon room-card-delete"
+              title="Delete room"
+              aria-label={`Delete ${room.name}`}
+              onClick={handleDelete}
+            >
+              <Trash2 size={15} />
+            </button>
           )}
+
+          <div ref={menuRef} className="room-card-menu">
+            <button
+              className="btn btn-ghost btn-icon"
+              title="More actions"
+              aria-label="More actions"
+              onClick={(e) => { e.stopPropagation(); setMenuOpen((v) => !v); }}
+              style={{ color: 'var(--tx-3)' }}
+            >
+              <MoreVertical size={15} />
+            </button>
+            {menuOpen && (
+              <div className="dropdown">
+                <button className="dropdown-item" onClick={(e) => { navigate(`/room/${room.id}`); e.stopPropagation(); }}>
+                  <ExternalLink size={13} /> Open room
+                </button>
+                <button className="dropdown-item" onClick={copyCode}>
+                  <Copy size={13} /> Copy room code
+                </button>
+                {isOwner && (
+                  <>
+                    <div style={{ height: 1, background: 'var(--bd-dim)', margin: '4px 0' }} />
+                    <button className="dropdown-item danger" onClick={handleDelete}>
+                      <Trash2 size={13} /> Delete room
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -324,6 +341,9 @@ export function DashboardPage() {
   const [search, setSearch]     = useState('');
   const [creating, setCreating] = useState(false);
   const [joining, setJoining]   = useState(false);
+  const [pendingDelete, setPendingDelete] = useState<Room | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const toast                   = useToast();
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -343,13 +363,18 @@ export function DashboardPage() {
     setRooms((prev) => [room, ...prev]);
   };
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Delete this room? This action cannot be undone.')) return;
+  const handleDeleteConfirmed = async () => {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
     try {
-      await roomsApi.delete(id);
-      setRooms((prev) => prev.filter((r) => r.id !== id));
+      await roomsApi.delete(pendingDelete.id);
+      setRooms((prev) => prev.filter((r) => r.id !== pendingDelete.id));
+      toast.success('Room deleted', `"${pendingDelete.name}" and its history are gone.`);
+      setPendingDelete(null);
     } catch (err: any) {
-      alert(err?.message ?? 'Failed to delete room.');
+      toast.error('Delete failed', err?.message ?? 'Could not delete this room.');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -481,7 +506,7 @@ export function DashboardPage() {
                 key={room.id}
                 room={room}
                 isOwner={room.ownerId === user?.id}
-                onDelete={handleDelete}
+                onDelete={setPendingDelete}
               />
             ))}
           </div>
@@ -497,6 +522,46 @@ export function DashboardPage() {
         open={joining}
         onClose={() => setJoining(false)}
       />
+
+      <Modal
+        open={!!pendingDelete}
+        onClose={() => { if (!deleting) setPendingDelete(null); }}
+        title="Delete this room?"
+        footer={
+          <>
+            <Button variant="ghost" size="md" onClick={() => setPendingDelete(null)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              size="md"
+              loading={deleting}
+              icon={<Trash2 size={14} />}
+              onClick={handleDeleteConfirmed}
+            >
+              Delete room
+            </Button>
+          </>
+        }
+      >
+        <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
+          <div style={{
+            flexShrink: 0, width: 34, height: 34, borderRadius: 'var(--r-md)',
+            background: 'var(--red-dim)', color: 'var(--red)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            <AlertTriangle size={17} />
+          </div>
+          <div style={{ fontSize: 14, color: 'var(--tx-2)', lineHeight: 1.6 }}>
+            <strong style={{ color: 'var(--tx-1)' }}>{pendingDelete?.name}</strong> and its
+            saved code history will be permanently deleted. Anyone still in the room will be
+            sent back to their dashboard.
+            <div style={{ marginTop: 10, fontSize: 13, color: 'var(--tx-3)' }}>
+              This can't be undone.
+            </div>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

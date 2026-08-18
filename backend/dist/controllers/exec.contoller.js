@@ -1,23 +1,27 @@
-import { PrismaClient } from "@prisma/client";
 import { execQueue, enqueueExec } from "../queues/execQueue.js";
-const prisma = new PrismaClient();
+import { resolveRoomAccess } from "../services/roomAccess.js";
 // POST /api/execute
 // Body: { roomId, code, language }
 // Returns: { jobId }
 export const runCode = async (req, res) => {
     const { roomId, code, language } = req.body;
-    const userId = req.userId ?? "anonymous";
+    const userId = req.userId;
     const socketId = req.headers["x-socket-id"] ?? "";
+    if (!userId) {
+        return res.status(401).json({ message: "Not authenticated" });
+    }
     if (!code || !language) {
         return res.status(400).json({ message: "code and language are required" });
     }
     if (!roomId) {
         return res.status(400).json({ message: "roomId is required" });
     }
-    // Verify room exists
-    const room = await prisma.room.findUnique({ where: { id: roomId } });
-    if (!room)
-        return res.status(404).json({ message: "Room not found" });
+    // Verify the room exists AND that this user is allowed in it — the result is
+    // broadcast to the whole room, so running code in a room you cannot open
+    // would be a way to both read and write into it.
+    const access = await resolveRoomAccess(roomId, userId);
+    if (!access.ok)
+        return res.status(access.status).json({ message: access.message });
     try {
         const jobId = await enqueueExec({ roomId, code, language, userId, socketId });
         return res.json({ jobId });
