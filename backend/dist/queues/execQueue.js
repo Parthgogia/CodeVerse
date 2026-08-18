@@ -2,12 +2,13 @@ import { Queue, Worker } from "bullmq";
 import { createRedisClient } from "../config/redis.js";
 import { runInDocker } from "./dockerRunner.js";
 // ── Queue ─────────────────────────────────────────────────
+// execQueue accepts jobs and stores them in Redis. It doesn't run anything itself.
 export const execQueue = new Queue("exec", {
     connection: createRedisClient(),
     defaultJobOptions: {
-        attempts: 2,
-        backoff: { type: "fixed", delay: 2000 },
-        removeOnComplete: { count: 200 },
+        attempts: 2, // retry once if it fails (e.g. transient Docker error)
+        backoff: { type: "fixed", delay: 2000 }, // retry after 2 seconds if failed
+        removeOnComplete: { count: 200 }, // keep last 200 completed jobs in Redis (for inspection)
         removeOnFail: { count: 100 },
     },
 });

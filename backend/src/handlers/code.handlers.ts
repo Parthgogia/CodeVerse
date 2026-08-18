@@ -1,29 +1,7 @@
 import type { Server, Socket } from "socket.io";
 import { RoomManager }   from "../realtime/roomManager.js";
+import { RoomDocs }      from "../realtime/roomDocs.js";
 import { checkRateLimit, Limits } from "../realtime/rateLimiter.js";
-import { prisma } from "../config/db.js";
-
-
-// Debounce snapshot saves per room to avoid write storms
-const snapshotTimers = new Map<string, ReturnType<typeof setTimeout>>();
-
-function scheduleSnapshot(roomId: string, content: string, delaySecs = 8) {
-  const existing = snapshotTimers.get(roomId);
-  if (existing) clearTimeout(existing);
-
-  const timer = setTimeout(async () => {
-    snapshotTimers.delete(roomId);
-    if (!content.trim()) return;
-    try {
-      await prisma.snapshot.create({ data: { roomId, content } });
-      console.log(`[snapshot] Saved snapshot for room ${roomId} (${content.length} chars)`);
-    } catch (err) {
-      console.error(`[snapshot] Failed to save for ${roomId}:`, err);
-    }
-  }, delaySecs * 1000);
-
-  snapshotTimers.set(roomId, timer);
-}
 
 export function registerCodeHandlers(io: Server, socket: Socket) {
   const userId: string = (socket.data as any).userId;
@@ -41,6 +19,11 @@ export function registerCodeHandlers(io: Server, socket: Socket) {
 
     // Relay raw Yjs binary update to every other client in the room
     socket.to(roomId).emit("yjs:update", { update });
+
+    // …and fold it into the server's own copy of the document. This is what
+    // actually makes a room persist: the relay alone left the server with no
+    // idea what the code was, so nothing could ever be written to Postgres.
+    void RoomDocs.applyUpdate(roomId, new Uint8Array(update));
   });
 
   // ── code:change ───────────────────────────────────────
@@ -56,8 +39,5 @@ export function registerCodeHandlers(io: Server, socket: Socket) {
 
     // Broadcast to all OTHER clients in the room
     socket.to(roomId).emit("code:update", { content, userId });
-
-    // Debounced snapshot write
-    scheduleSnapshot(roomId, content);
   });
 }

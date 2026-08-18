@@ -24,17 +24,16 @@ const LANG_CONFIG = {
         image: "gcc:13",
         filename: "main.cpp",
         cmd: (f) => {
-            const out = f.replace(".cpp", "");
-            // compile then run; joined via sh -c
-            return ["sh", "-c", `g++ -o ${out} ${f} && ${out}`];
+            // compile to /tmp since /code is read-only
+            return ["sh", "-c", `g++ -o /tmp/main ${f} && /tmp/main`];
         },
     },
     java: {
-        image: "openjdk:21-slim",
+        image: "eclipse-temurin:21-alpine",
         filename: "Main.java",
         cmd: (f) => {
-            const dir = f.replace("/Main.java", "");
-            return ["sh", "-c", `cd ${dir} && javac Main.java && java Main`];
+            // copy to /tmp and compile/run there since /code is read-only
+            return ["sh", "-c", `cp ${f} /tmp/ && cd /tmp && javac Main.java && java Main`];
         },
     },
 };
@@ -50,37 +49,44 @@ export async function runInDocker(code, language, timeoutMs = DEFAULT_TIMEOUT_MS
             executionTimeMs: 0,
         };
     }
-    // Create a unique temp directory for this run
+    //Step 1 — Create a unique temp directory for this run
     const runId = randomBytes(8).toString("hex");
-    const tmpDir = join(tmpdir(), `codesync-${runId}`);
+    const tmpDir = join(tmpdir(), `codeverse-${runId}`);
+    //Each execution gets its own isolated directory (/tmp/codesync-<random>). 
+    // The user's code is written to disk here. randomBytes prevents any two runs from colliding.
     await mkdir(tmpDir, { recursive: true });
     const filePath = join(tmpDir, cfg.filename);
     await writeFile(filePath, code, "utf-8");
     const containerFile = `/code/${cfg.filename}`;
     const cmd = cfg.cmd(containerFile);
+    // Step 2 — Build the Docker argv
     const dockerArgs = [
-        "run",
-        "--rm", // auto-remove container
-        "--network", "none", // no network access
-        "--memory", "256m", // 256 MB RAM limit
-        "--memory-swap", "256m", // no swap
-        "--cpus", "0.5", // half a CPU
-        "--pids-limit", "64", // no fork bombs
-        "--read-only", // read-only filesystem
-        "--tmpfs", "/tmp:rw,size=32m", // writable /tmp for scratch
-        "-v", `${tmpDir}:/code:ro`, // mount code read-only
-        "-w", "/code",
-        cfg.image,
-        ...cmd,
+        "run", "--rm", // delete container immediately after exit
+        "--network", "none", // no internet — can't exfiltrate data or download payloads
+        "--memory", "256m", // hard RAM ceiling
+        "--memory-swap", "256m", // swap = 0 (same as memory), prevents disk-backed memory abuse
+        "--cpus", "0.5", // max half a CPU core
+        "--pids-limit", "64", // prevents fork bombs (process.fork() spam)
+        "--read-only", // container filesystem is immutable
+        "--tmpfs", "/tmp:rw,size=32m,exec", // small writable scratch space (needed by some runtimes)
+        "-v", `${tmpDir}:/code:ro`, // mount user code read-only — container can't modify it
+        "-w", "/code", // working directory inside container
+        cfg.image, ...cmd,
     ];
+    // Step 3 — Spawn and collect output
     const start = Date.now();
     return new Promise((resolve) => {
         let stdout = "";
         let stderr = "";
         let settled = false;
         const proc = spawn("docker", dockerArgs, { stdio: ["ignore", "pipe", "pipe"] });
+        // stdio: ["ignore", "pipe", "pipe"]` — stdin is disabled (user code can't block waiting for input), stdout and stderr are streamed back in real time.
         proc.stdout.on("data", (d) => { stdout += d.toString(); });
         proc.stderr.on("data", (d) => { stderr += d.toString(); });
+        // The settled flag ensures only one of these ever resolves the promise:
+        // proc "close"  → normal exit  → resolve with exit code + output
+        // setTimeout    → timed out    → SIGKILL proc, resolve with exitCode 124
+        // proc "error"  → Docker not running / bad args → resolve with helpful error message
         // Hard timeout
         const timer = setTimeout(() => {
             if (settled)
