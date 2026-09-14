@@ -8,6 +8,7 @@
     "build": "tsc --project tsconfig.json",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
+    "sandbox:build": "docker build -t codeverse-sandbox-ts -f sandbox/typescript.Dockerfile sandbox",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",

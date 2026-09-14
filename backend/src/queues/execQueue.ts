@@ -1,7 +1,7 @@
 import { Queue, Worker, Job } from "bullmq";
 import { createRedisClient } from "../config/redis.js";
 import type { Server } from "socket.io";
-import { runInDocker, type ExecResult } from "./dockerRunner.js";
+import { runInDocker, startContainerReaper, type ExecResult } from "./dockerRunner.js";
 
 // ── Job payload ───────────────────────────────────────────
 export interface ExecJobData {
@@ -35,6 +35,10 @@ export async function enqueueExec(data: ExecJobData): Promise<string> {
 // ── Worker factory ────────────────────────────────────────
 // Call once at server startup, passing the Socket.IO server.
 export function startExecWorker(io: Server): Worker<ExecJobData> {
+  // Sweep for containers a previous incarnation of this process left running,
+  // then keep sweeping — see reapOrphanContainers for why they exist at all.
+  startContainerReaper();
+
   const worker = new Worker<ExecJobData>(
     "exec",
     async (job: Job<ExecJobData>) => {

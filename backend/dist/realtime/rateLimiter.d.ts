@@ -7,6 +7,13 @@ interface RateLimitOptions {
  * Key format: rl:{event}:{userId}
  */
 export declare function checkRateLimit(userId: string, event: string, opts: RateLimitOptions): Promise<boolean>;
+/**
+ * Seconds until the window for {event} resets for {userId}. Used to populate
+ * `Retry-After` once checkRateLimit has already refused — never call it first,
+ * it does not count the request. Falls back to the full window length when the
+ * key has no TTL or Redis is unreachable, which is the conservative answer.
+ */
+export declare function rateLimitRetryAfter(userId: string, event: string, opts: RateLimitOptions): Promise<number>;
 export declare const Limits: {
     readonly CODE_CHANGE: {
         readonly maxPerWindow: 120;

@@ -26,6 +26,25 @@ export async function checkRateLimit(
   }
 }
 
+/**
+ * Seconds until the window for {event} resets for {userId}. Used to populate
+ * `Retry-After` once checkRateLimit has already refused — never call it first,
+ * it does not count the request. Falls back to the full window length when the
+ * key has no TTL or Redis is unreachable, which is the conservative answer.
+ */
+export async function rateLimitRetryAfter(
+  userId: string,
+  event: string,
+  opts: RateLimitOptions,
+): Promise<number> {
+  try {
+    const ttl = await getRedis().ttl(`rl:${event}:${userId}`);
+    return ttl > 0 ? ttl : opts.windowSecs;
+  } catch {
+    return opts.windowSecs;
+  }
+}
+
 // Presets
 export const Limits = {
   CODE_CHANGE:   { maxPerWindow: 120, windowSecs: 10  }, // 12 changes/s

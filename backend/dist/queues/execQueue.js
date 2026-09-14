@@ -1,6 +1,6 @@
 import { Queue, Worker } from "bullmq";
 import { createRedisClient } from "../config/redis.js";
-import { runInDocker } from "./dockerRunner.js";
+import { runInDocker, startContainerReaper } from "./dockerRunner.js";
 // ── Queue ─────────────────────────────────────────────────
 // execQueue accepts jobs and stores them in Redis. It doesn't run anything itself.
 export const execQueue = new Queue("exec", {
@@ -22,6 +22,9 @@ export async function enqueueExec(data) {
 // ── Worker factory ────────────────────────────────────────
 // Call once at server startup, passing the Socket.IO server.
 export function startExecWorker(io) {
+    // Sweep for containers a previous incarnation of this process left running,
+    // then keep sweeping — see reapOrphanContainers for why they exist at all.
+    startContainerReaper();
     const worker = new Worker("exec", async (job) => {
         const { roomId, code, language, socketId } = job.data;
         console.log(`[worker] Processing job ${job.id} — ${language} in room ${roomId}`);

@@ -1,5 +1,7 @@
 import { execQueue, enqueueExec } from "../queues/execQueue.js";
+import { EXEC_LIMITS } from "../queues/dockerRunner.js";
 import { resolveRoomAccess } from "../services/roomAccess.js";
+import { checkRateLimit, rateLimitRetryAfter, Limits } from "../realtime/rateLimiter.js";
 // POST /api/execute
 // Body: { roomId, code, language }
 // Returns: { jobId }
@@ -15,6 +17,27 @@ export const runCode = async (req, res) => {
     }
     if (!roomId) {
         return res.status(400).json({ message: "roomId is required" });
+    }
+    // Bound the payload before it is copied into Redis and onto disk. Validation
+    // errors like this one are deliberately not counted against the rate limit.
+    const codeBytes = Buffer.byteLength(code, "utf-8");
+    if (codeBytes > EXEC_LIMITS.maxCodeBytes) {
+        return res.status(413).json({
+            message: `Code is too large (${Math.ceil(codeBytes / 1024)} KB; limit is ${EXEC_LIMITS.maxCodeBytes / 1024} KB).`,
+        });
+    }
+    // Throttle before authorizing, same order as the socket handlers: this is the
+    // most expensive call in the system (it spawns a container), so the cheap
+    // Redis check runs before the Postgres lookup. Counted per user, not per
+    // room, so switching rooms does not reset the budget.
+    const ok = await checkRateLimit(userId, "run:code", Limits.RUN_CODE);
+    if (!ok) {
+        const retryAfter = await rateLimitRetryAfter(userId, "run:code", Limits.RUN_CODE);
+        res.set("Retry-After", String(retryAfter));
+        return res.status(429).json({
+            message: `Too many runs — try again in ${retryAfter}s.`,
+            retryAfter,
+        });
     }
     // Verify the room exists AND that this user is allowed in it — the result is
     // broadcast to the whole room, so running code in a room you cannot open

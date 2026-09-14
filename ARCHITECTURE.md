@@ -169,9 +169,10 @@ Three things this view is meant to make obvious:
 1. **REST and WebSocket are independent front doors that converge on the same
    authorization rule.** The socket re-authorizes on `room:join` even though REST already
    did — it must never assume the client asked politely first.
-2. **Every socket handler passes through the rate limiter**, and only the socket handlers
-   do — ❌ which is exactly the gap: `POST /execute` reaches `execQueue` without a throttle,
-   because the limiter sits on the socket path only (§7.7).
+2. **Every entry point that costs something passes through the rate limiter** — the
+   socket handlers and `POST /execute` alike — and always in the same order: validate,
+   throttle, *then* authorize. A malformed request never consumes budget, and a throttled
+   one never reaches Postgres (§7.7).
 3. **`RoomManager` and `RoomDocs` are deliberately separate.** Presence is transient and
    never persisted; the document is durable and never thrown away. Conflating them is the
    most likely way to break this system.
@@ -192,7 +193,7 @@ happens when the thing holding it dies?"
 | Cursors / selections | Nowhere; in flight only | Milliseconds | Nothing to lose, by design |
 | Rate-limit counters | Redis, TTL'd | 10–30 s | Limits reset; fails open ✅ |
 | Queued jobs | Redis (BullMQ) | Until processed | Survive a restart; another worker claims them ✅ |
-| Running container | Docker | ≤ 10 s | Killed with its worker |
+| Running container | Docker | ≤ 10 s | Outlives its worker; self-terminates via the CPU ulimit or is swept by the reaper ✅ |
 
 The pattern: **anything that must survive goes to Postgres, anything shared between
 instances goes to Redis, anything on the hot path stays in process memory.** The in-process
@@ -407,13 +408,20 @@ sequenceDiagram
     participant IO as Socket.IO (all instances)
 
     U->>API: POST /api/execute { roomId, code, language }
+    API->>API: code ≤ 64 KB? else 413
+    API->>API: rate limit 5/30s? else 429 + Retry-After
     API->>API: authorize room access
     API->>Q: enqueue job → jobId
     API-->>U: { jobId }
     U->>U: start HTTP poller (900ms) as a fallback
     Q->>W: job picked up by ANY instance's worker
-    W->>D: docker run --rm --network none --memory 256m ...
-    D-->>W: stdout / stderr / exit code
+    W->>D: docker run --rm --name codeverse-exec-{id} --memory 256m --cpus 0.5 ...
+    alt finishes within limits
+        D-->>W: stdout / stderr / exit code
+    else 10s elapsed or 64 KB of output
+        W->>D: docker rm -f codeverse-exec-{id}
+        W->>W: exit 124 (timeout) or 1 (output cap)
+    end
     W->>IO: io.to(roomId).emit('code:run-result')
     IO-->>U: result (fans across instances via Redis)
     U->>U: cancel the poller — whichever arrived first wins
@@ -674,6 +682,10 @@ Why a queue at all, when execution could be synchronous? Three reasons: a run ta
 seconds and would hold an HTTP connection open; unbounded concurrent `docker run` calls
 will exhaust the host; and retries need somewhere to live.
 
+Nothing reaches the queue unchecked: the controller rejects oversized code (`413`) and
+throttled users (`429`, §7.7) before `execQueue.add()`, so a queued job is always one that
+a permitted user is allowed to run at that moment.
+
 Configuration: 2 attempts, fixed 2s backoff, last 200 completed / 100 failed jobs retained
 for inspection, worker concurrency 4 per instance. Job ids are
 `exec-{roomId}-{Date.now()}`.
@@ -694,10 +706,13 @@ Every run gets a fresh container. The full argv:
 
 ```
 docker run --rm                      delete the container on exit
+  --name codeverse-exec-{runId}      addressable, so a timeout can kill *the container*
+  --label codeverse.exec=1           discoverable by the orphan reaper
   --network none                     no DNS, no internet, no host network
-  --memory 256m --memory-swap 256m   hard RAM ceiling, swap disabled
+  --memory 256m --memory-swap 256m   hard RAM ceiling, swap disabled → OOM-killed above it
   --cpus 0.5                         half a core
   --pids-limit 64                    fork-bomb protection
+  --ulimit cpu=10:12                 kernel CPU-seconds backstop (SIGXCPU, then SIGKILL)
   --read-only                        immutable container filesystem
   --tmpfs /tmp:rw,size=32m,exec      the only writable surface
   -v {hostTmpDir}:/code:ro           user code, mounted read-only
@@ -705,9 +720,36 @@ docker run --rm                      delete the container on exit
   {image} {cmd}
 ```
 
-Plus, outside Docker: a 10s `setTimeout` that `SIGKILL`s the process (exit code 124),
-stdout capped at 8 KB, stderr at 4 KB, stdin closed so code cannot block on input, and the
-host temp directory removed in every exit path.
+Plus, outside Docker: a 10s wall-clock timer, a 64 KB cap on combined stdout+stderr, a
+64 KB cap on the submitted code (`413` at `POST /api/execute`), stdin closed so code
+cannot block on input, and the host temp directory removed in every exit path. All the
+numbers live in `EXEC_LIMITS` in `dockerRunner.ts` and each is overridable via
+`EXEC_*` environment variables (§8).
+
+**How each limit is enforced and what the user sees:**
+
+| Abuse | Caught by | Result |
+|-------|-----------|--------|
+| `while(true){}` | host timer → `docker rm -f {name}` | exit 124, "Execution timed out after 10s" |
+| `while(true) print(...)` | output cap → `docker rm -f {name}` | exit 1, "Output limit exceeded (64 KB)", partial stdout kept |
+| unbounded allocation | cgroup OOM killer | exit 137, "Killed — memory limit exceeded (256 MB)" |
+| fork bomb | `--pids-limit` | spawn fails inside the sandbox |
+| 1 MB paste | controller | `413` before anything is queued |
+| worker dies mid-run | `--ulimit cpu` + reaper | container dies on its own within ~20s, or is swept |
+
+The wall-clock timer used to `SIGKILL` the `docker run` **client** — which detaches the
+CLI but leaves the container running in the daemon. Every infinite loop therefore leaked
+a container pinned at half a core until Docker Desktop fell over. The container is now
+named and removed by name; the promise settles immediately and the mount is deleted only
+after the container is gone.
+
+**Orphan reaper.** The timer lives in the API process, which restarts on every save
+under `tsx watch` and can crash in production; a container outlives its parent. The
+worker therefore sweeps on startup and every 60s for labelled containers older than
+timeout + 15s and removes them. It is age-based rather than "everything with the label"
+so a second instance on the same host never kills a sibling's in-flight run. The
+`--ulimit cpu` is the belt to that suspender: a busy loop that nobody is watching still
+dies on its own once it has burned 10 CPU-seconds.
 
 | Language | Image | Command | Status |
 |----------|-------|---------|--------|
@@ -715,19 +757,22 @@ host temp directory removed in every exit path.
 | Python | `python:3.12-alpine` | `python main.py` | ✅ |
 | C++ | `gcc:13` | `g++ -o /tmp/main main.cpp && /tmp/main` | ✅ |
 | Java | `eclipse-temurin:21-alpine` | `cp → /tmp`, `javac`, `java Main` | ✅ |
-| TypeScript | `node:20-alpine` | `npx --yes ts-node --transpile-only main.ts` | ❌ **broken** |
+| TypeScript | `codeverse-sandbox-ts` (built locally) | `tsx main.ts` | ✅ |
 
-❌ **TypeScript cannot work as written.** `npx --yes ts-node` tries to download ts-node
-from the npm registry, but `--network none` blocks DNS. Verified failure:
-`npm error code EAI_AGAIN … getaddrinfo registry.npmjs.org`, exit 1. Any user who picks
-TypeScript and hits Run gets an npm error instead of output. The fix is a purpose-built
-image with TypeScript preinstalled, or transpiling client-side and executing the emitted
-JavaScript with `node`.
+**TypeScript runs from a purpose-built image.** The stock Node image has no TypeScript
+toolchain, and the sandbox has no network, so the toolchain cannot be fetched at run time
+— the previous `npx --yes ts-node` command failed with `EAI_AGAIN … registry.npmjs.org`
+on every run. `backend/sandbox/typescript.Dockerfile` is `node:20-alpine` plus a pinned
+`tsx` (esbuild-based: strips types without type-checking, the same semantics as the old
+`--transpile-only` intent, and much faster to start). Build it once per host with
+`npm run sandbox:build`; it is ~210 MB. Stack traces map back to `main.ts` line numbers.
 
 ⚠️ **First run of an uncached image will time out.** `docker run` pulls a missing image
-before starting the container, but the 10s kill timer starts at spawn. `gcc:13` is ~2 GB.
+before starting the container, but the 10s timer starts at spawn. `gcc:13` is ~2 GB.
 On a fresh host the first C++ run dies mid-pull with a confusing timeout. Images must be
-pre-pulled during deployment.
+pre-pulled during deployment — and `codeverse-sandbox-ts` must be *built*, since it is
+not on any registry; without it every TypeScript run fails with
+`Unable to find image 'codeverse-sandbox-ts:latest'`.
 
 **What this sandbox does not defend against** 🔲: container escape via a kernel exploit
 (there is no gVisor/Kata/microVM layer, and no seccomp or AppArmor profile beyond Docker's
@@ -751,17 +796,22 @@ allow if count <= max
 | `code:change` | 120 / 10s | ✅ (on a path nothing uses) |
 | `cursor:move` / awareness | 300 / 10s | ✅ |
 | `room:join` | 10 / 30s | ✅ |
-| **code execution** | 5 / 30s | ❌ **defined but never called** |
+| `POST /api/execute` | 5 / 30s | ✅ |
 
-❌ The `RUN_CODE` preset exists in `rateLimiter.ts` and is documented in the README, but
-no code path invokes it. `POST /api/execute` has **no per-user throttle at all** — the
-most expensive operation in the system is the only unthrottled one. One line in
-`exec.contoller.ts` closes this.
+✅ Execution is throttled per user in `exec.contoller.ts`, checked *before* the room
+lookup (same order as the socket handlers) so a hammering client costs one Redis `INCR`
+rather than a Postgres query. A refused run returns `429` with a `Retry-After` header and
+`{ message, retryAfter }` — the frontend's fetch wrapper already surfaces `message`, so
+the user sees "Too many runs — try again in Ns." in the output pane. The budget is per
+user, not per room: switching rooms does not reset it. `GET /api/execute/:jobId` (the
+polling fallback) is deliberately not throttled.
 
 ⚠️ **Fixed windows allow double-rate bursts at boundaries.** 200 requests at 9.9s plus 200
 at 10.1s is 400 in 200ms, all "within limits". A sliding-window log or token bucket
 (`INCRBYFLOAT` with a timestamp, or a small Lua script) removes this. For per-keystroke
-events it barely matters; for execution it would.
+events it barely matters; for execution it is the one place it does — 5 runs at the end of
+one window and 5 at the start of the next is 10 containers in about a second, twice what
+"5 per 30s" implies. Bounded, but worth closing with a sliding window for `RUN_CODE`.
 
 ⚠️ **Limits are per user, not per room or per IP.** Registration and login are unthrottled,
 so account creation itself is not rate limited. 🔲
@@ -856,24 +906,29 @@ revocation list. Logout is client-side only; a stolen token stays valid until it
 | Docker not running | Every run returns "Failed to start Docker: … Make sure Docker is running" ✅ |
 | Redis down | Rate limits fail open; presence falls back to local; queue and execution stop ⚠️ |
 | Postgres down | Auth and room endpoints 500; live editing continues; saves retry and fail ⚠️ |
-| Instance SIGKILLed | Ghost presence reaped in ≤30s; unsaved edits since the last 4s debounce are lost ⚠️ |
+| Instance SIGKILLed | Ghost presence reaped in ≤30s; unsaved edits since the last 4s debounce are lost ⚠️; in-flight sandbox containers survive it but self-terminate via the CPU ulimit or are swept by the next worker's reaper ✅ |
 | Client disconnects | Reconnects automatically (10 attempts); departure suppressed for 3s ✅ |
 | Deleted room, users inside | `room:deleted` → toast → redirect; cluster-wide purge ✅ |
 | Two instances saving at once | Read-merge-write under a Redis lock; no data loss ✅ |
-| Runaway user code | 10s SIGKILL, 256 MB cap, 64 pids, 0.5 CPU, no network ✅ |
+| Runaway user code | 10s wall clock (container removed by name), 256 MB OOM, 64 KB output cap, CPU-seconds ulimit, 64 pids, 0.5 CPU, no network ✅ |
+| Execution spam | 5 runs / 30s per user → `429` + `Retry-After`; 64 KB code cap → `413` ✅ |
 
 ---
 
 ## 8. Tuning constants
 
-Everything worth knowing, in one place. All are compile-time constants; 🔲 none are
-configurable via environment variables.
+Everything worth knowing, in one place. The execution limits are overridable via
+environment variables; 🔲 everything else is a compile-time constant.
 
 | Constant | Value | Where |
 |----------|-------|-------|
-| Execution timeout | 10 s | `dockerRunner.ts` |
-| Execution memory / CPU / pids | 256 MB / 0.5 / 64 | `dockerRunner.ts` |
-| stdout / stderr caps | 8 KB / 4 KB | `dockerRunner.ts` |
+| Execution timeout | 10 s (`EXEC_TIMEOUT_MS`) | `dockerRunner.ts` |
+| Execution memory / CPU / pids | 256 MB / 0.5 / 64 (`EXEC_MEMORY_MB`, `EXEC_CPUS`, `EXEC_PIDS`) | `dockerRunner.ts` |
+| Execution tmpfs | 32 MB (`EXEC_TMPFS_MB`) | `dockerRunner.ts` |
+| Execution output cap (kills the run) | 64 KB (`EXEC_MAX_OUTPUT_BYTES`) | `dockerRunner.ts` |
+| Execution code size cap | 64 KB (`EXEC_MAX_CODE_BYTES`) | `dockerRunner.ts` |
+| stdout / stderr returned | 8 KB / 4 KB | `dockerRunner.ts` |
+| Orphan reaper interval / age | 60 s / timeout + 15 s | `dockerRunner.ts` |
 | Worker concurrency | 4 per instance | `execQueue.ts` |
 | Job retries / backoff | 2 attempts / 2 s fixed | `execQueue.ts` |
 | Document save debounce | 4 s | `roomDocs.ts` |
@@ -894,8 +949,8 @@ configurable via environment variables.
 
 Ordered by how much they would hurt in production.
 
-1. **Fix TypeScript execution** ❌ — currently returns an npm error to every user who picks it.
-2. **Apply the execution rate limit** ❌ — one line; the queue is otherwise open to abuse.
+1. ~~Fix TypeScript execution~~ ✅ — done; runs from a local `codeverse-sandbox-ts` image with `tsx` baked in.
+2. ~~Apply the execution rate limit~~ ✅ — done; `POST /api/execute` returns 429 with `Retry-After`.
 3. **Send incremental Yjs updates as binary** ⚠️ — the single biggest bandwidth win.
 4. **Split the worker from the API** ⚠️ — so execution load cannot starve WebSocket traffic.
 5. **Delete `app.ts` and `user.routes.ts`** ❌ — unmounted, but they store plaintext

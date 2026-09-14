@@ -84,6 +84,10 @@ cp .env.example .env
 npm run db:generate
 npm run db:push
 
+# Build the TypeScript sandbox image (once per machine; the other runtime
+# images are pulled automatically on first use)
+npm run sandbox:build
+
 # Start dev server (tsx watch — hot reload)
 npm run dev
 ```
@@ -116,6 +120,13 @@ Frontend runs on **http://localhost:5173**. All `/api` and `/socket.io` requests
 | `REDIS_PORT`     | `6379`                                            |          |
 | `PORT`           | `4000`                                            |          |
 | `CLIENT_ORIGIN`  | `http://localhost:5173`                           |          |
+| `EXEC_TIMEOUT_MS` | `10000` — wall-clock limit per run              |          |
+| `EXEC_MEMORY_MB` | `256` — container memory cap (OOM-killed above)   |          |
+| `EXEC_CPUS`      | `0.5` — share of one core per run                 |          |
+| `EXEC_PIDS`      | `64` — process cap (fork-bomb guard)              |          |
+| `EXEC_TMPFS_MB`  | `32` — writable scratch space                     |          |
+| `EXEC_MAX_OUTPUT_BYTES` | `65536` — stdout+stderr cap; run is stopped past it |   |
+| `EXEC_MAX_CODE_BYTES`   | `65536` — submitted code cap (`413` above it)  |          |
 
 ### web/.env
 
@@ -158,7 +169,8 @@ GET    /api/rooms/:id/snapshots  last 20 code snapshots
 DELETE /api/rooms/:id            delete room (owner only)
 
 POST   /api/execute              { roomId, code, language } → { jobId }
-GET    /api/execute/:jobId       poll job status
+                                 413 if code > 64 KB · 429 + Retry-After if > 5 runs / 30 s
+GET    /api/execute/:jobId       poll job status (not rate limited)
 ```
 
 ## Persistence
@@ -242,22 +254,26 @@ re-mount no longer makes the room flash "X left / X joined".
 
 ## Supported languages
 
-| Language   | Runtime image      |
-|------------|--------------------|
-| JavaScript | node:20-alpine     |
-| TypeScript | node:20-alpine     |
-| Python     | python:3.12-alpine |
-| C++        | gcc:13             |
-| Java       | eclipse-temurin:21-alpine    |
+| Language   | Runtime image      | Command |
+|------------|--------------------|---------|
+| JavaScript | node:20-alpine     | `node main.js` |
+| TypeScript | codeverse-sandbox-ts (local build, `backend/sandbox/typescript.Dockerfile`) | `tsx main.ts` — types stripped, not checked |
+| Python     | python:3.12-alpine | `python main.py` |
+| C++        | gcc:13             | `g++ … && ./main` |
+| Java       | eclipse-temurin:21-alpine    | `javac Main.java && java Main` |
+
+The sandbox has no network, so every toolchain must already be in its image. The four
+public images are pulled on first use; the TypeScript image must be built once with
+`npm run sandbox:build` (from `backend/`).
 
 ## How code execution works
 
 1. User clicks **Run** (or Ctrl+Enter)
-2. Frontend `POST /api/execute` → backend enqueues a BullMQ job, returns `jobId`
+2. Frontend `POST /api/execute` → backend checks code size (`413`), the per-user rate limit (`429` + `Retry-After`), then room access, then enqueues a BullMQ job and returns `jobId`
 3. BullMQ worker picks up the job, calls `dockerRunner.ts`
-4. `dockerRunner` mounts code into a fresh container: `--network none --memory 256m --cpus 0.5 --pids-limit 64 --read-only`
-5. Hard timeout of 10 seconds enforced by `setTimeout` + `SIGKILL`
-6. Result emitted back to the entire Socket.IO room via `io.to(roomId).emit('code:run-result', result)`
+4. `dockerRunner` mounts code into a fresh, named container: `--network none --memory 256m --cpus 0.5 --pids-limit 64 --ulimit cpu=10:12 --read-only`
+5. Limits, all tunable via `EXEC_*` env vars: 10 s wall clock (container is removed by name), 256 MB memory (OOM-killed), 64 KB output (run is stopped), 64 KB code (`413`). A reaper sweeps containers orphaned by a worker restart.
+6. Result `{ stdout, stderr, exitCode, executionTimeMs }` emitted to the entire Socket.IO room via `io.to(roomId).emit('code:run-result', result)`. A limit that fired is explained in `stderr`: exit 124 = timed out, 137 = memory limit, 152 = CPU-time limit, 1 with "Output limit exceeded" = output cap
 7. Frontend socket handler receives result, cancels HTTP poller, updates output panel
 
 ## How real-time sync works
@@ -276,5 +292,5 @@ re-mount no longer makes the room flash "X left / X joined".
 | code:change | 120 / 10 s      |
 | yjs:update  | 200 / 10 s      |
 | cursor:move | 300 / 10 s      |
-| code run    | 5 / 30 s        |
+| code run    | 5 / 30 s (HTTP 429 + `Retry-After`) |
 | room join   | 10 / 30 s       |
