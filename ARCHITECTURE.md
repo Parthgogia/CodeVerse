@@ -227,7 +227,6 @@ flag), not a redesign, because the queue is already the only coupling between th
 
 ```
 server.ts                  entrypoint: env validation, Express, HTTP+Socket.IO, worker, shutdown
-app.ts                     ❌ DEAD — a second unused Express app, imported by nothing
 
 config/
   db.ts                    PrismaClient singleton (⚠️ logs every query)
@@ -237,7 +236,6 @@ middleware/
   auth.middleware.ts       JWT bearer guard → req.userId
 
 routes/                    thin routers: auth, room, exec
-  user.routes.ts           ❌ DEAD — plaintext passwords, unauthenticated user list
 
 controllers/
   auth.controller.ts       register / login / me — bcrypt(10), JWT 7d
@@ -359,7 +357,7 @@ sequenceDiagram
         RD->>DB: SELECT docState
         S-->>U: room:state { doc, code, users, language }
         S-->>Others: room:user-joined
-        U->>U: Y.applyUpdate(doc) — document restored
+        U->>U: bind editor to code:{language}, then Y.applyUpdate(doc)
     end
 ```
 
@@ -523,6 +521,10 @@ replica applies the identical bytes, reproduces the identical operation history,
 merges are idempotent. It is also why the editor no longer pre-seeds starter code before
 `room:state` arrives — that pre-seed would merge with the restored document and duplicate it.
 
+The same rule governs language switching (§7.3): a language's starter is inserted by
+exactly one party — the client that switched — and only into a text that is empty. Every
+other client rebinds and waits for the update.
+
 ---
 
 ## 7. Deep dives, subsystem by subsystem
@@ -592,12 +594,40 @@ leak forever.
 
 ### 7.3 Document persistence ✅
 
-The requirement: a room's code survives everyone leaving, a server restart, and being
-edited from two instances at once.
+The requirement: a room's code survives everyone leaving, a server restart, being
+edited from two instances at once — and switching language.
 
 **Storage.** `Room.docState` holds `Y.encodeStateAsUpdate(ydoc)` — bytes, for the reason
-in §6.4. `Snapshot.content` holds plain text for the human-readable history endpoint.
-They serve different purposes and neither replaces the other.
+in §6.4. `Snapshot.content` holds plain text of the language currently shown, for the
+human-readable history endpoint. They serve different purposes and neither replaces the
+other.
+
+**Layout: one `Y.Text` per language, all in the same `Y.Doc`.** The texts are keyed
+`code:{language}` (`code:python`, `code:javascript`, …). Switching language rebinds the
+editor to a different text; nothing is deleted or inserted. The persisted `docState` is
+the whole `Y.Doc`, so every language's code rides through the same save / merge / restore
+path with no extra bookkeeping — and switching back to a language shows exactly what was
+there before.
+
+❌→✅ This replaced a single shared text. Switching language used to *replace* that text
+with the new language's starter template — through Yjs, so the replacement was broadcast
+and persisted, and the previous language's code was genuinely gone from the CRDT. No
+amount of persistence could bring it back, because the persistence layer had faithfully
+saved the deletion.
+
+**Seeding per language.** The starter template is laid down when a language's text is
+empty — on first open of an empty room, and when someone switches to a language nobody has
+written in yet. Only the client that *initiates* the switch seeds; the others receive
+`room:language-changed`, rebind, and get the seed as an ordinary `yjs:update`. If they
+seeded too, the room would merge two copies of the template (§6.4).
+
+**Legacy rooms.** Rooms saved before this layout have their text under the bare key
+`code`. `RoomDocs.load` moves it under `code:{room.language}` once, under the `docsave`
+lock with a re-read of the stored state first, then empties the old key. This is the one
+place the server turns plain text into CRDT operations, and the lock is what keeps two
+instances from both doing it and merging into a duplicate. It happens before any client
+sees the state — a client that saw an empty per-language text would seed the starter,
+and a later migration would then land on top of it.
 
 **Lifecycle.**
 
@@ -953,8 +983,9 @@ Ordered by how much they would hurt in production.
 2. ~~Apply the execution rate limit~~ ✅ — done; `POST /api/execute` returns 429 with `Retry-After`.
 3. **Send incremental Yjs updates as binary** ⚠️ — the single biggest bandwidth win.
 4. **Split the worker from the API** ⚠️ — so execution load cannot starve WebSocket traffic.
-5. **Delete `app.ts` and `user.routes.ts`** ❌ — unmounted, but they store plaintext
-   passwords and expose an unauthenticated user list if ever wired up.
+5. ~~Delete `app.ts` and `user.routes.ts`~~ ✅ — removed. They were an unmounted early
+   scaffold that wrote plaintext passwords and served an unauthenticated user list; never
+   reachable, but one stray import away from being so.
 6. **Load balancer + TLS + real health checks** 🔲 — with polling kept disabled, or sticky
    sessions if not.
 7. **Membership model** 🔲 — private rooms are currently single-player.

@@ -218,7 +218,7 @@ async function sendRoomState(
   // the same content as plain text, kept for any client that can't use the CRDT.
   const [doc, code, users] = await Promise.all([
     RoomDocs.getState(roomId),
-    RoomDocs.getText(roomId),
+    RoomDocs.getText(roomId, lang ?? "python"),
     RoomManager.getPresence(roomId, userId),
   ]);
 

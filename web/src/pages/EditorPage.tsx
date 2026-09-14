@@ -205,7 +205,7 @@ export function EditorPage() {
   const handleRunRef = useRef<() => void>(() => {});
 
   // ── Yjs CRDT ─────────────────────────────────────────────
-  const { initializeCode, setCode: setYjsCode, applyServerState, bindEditor, unbindEditor } = useYjsEditor({
+  const { initializeCode, setCode: setYjsCode, applyServerState, switchLanguage, getText: getYjsText, bindEditor, unbindEditor } = useYjsEditor({
     roomId:       roomId ?? '',
     user,
     enabled:      !!roomId && !!user,
@@ -307,22 +307,29 @@ export function EditorPage() {
       code: string; doc?: number[]; users: ConnectedUser[]; language?: Language;
     }) => {
       // ✅ Update language from room:state so new joiners always see the current
-      // language even if someone changed it after the room was first created
+      // language even if someone changed it after the room was first created.
+      // Bind to that language's text *before* applying state, so the restore
+      // lands in the editor rather than in a text nobody is looking at.
+      const lang = state.language ?? language;
       if (state.language) setLanguage(state.language);
+      switchLanguage(lang);
 
       if (state.doc && state.doc.length > 2) {
         // The room has saved work — restore it from the server's CRDT state.
         // This is what makes a room survive everyone leaving.
         applyServerState(state.doc);
-      } else if (state.users.length === 0) {
-        // Genuinely empty room and nobody else is here: lay down the starter
-        // template and push it up, so the room has content from the outset.
-        const lang    = state.language ?? language;
+      }
+
+      // This language has never been written to and nobody else is here: lay
+      // down the starter template and push it up. Checked per language, not
+      // per document — a room with Python code and an untouched JavaScript
+      // text still gets the JavaScript starter.
+      if (state.users.length === 0 && getYjsText() === '') {
         const starter = LANGUAGES[lang]?.starter ?? '';
         if (starter) setYjsCode(starter);
       }
-      // Otherwise: empty room but others are present — they'll push their state
-      // on our arrival, so leave the document alone rather than racing them.
+      // Otherwise: others are present — they'll push their state on our
+      // arrival, so leave the document alone rather than racing them.
 
       setUsers(state.users);
     };
@@ -354,9 +361,12 @@ export function EditorPage() {
       initializeCode(content);
     };
 
-    // ✅ Language changed by another user in the room
+    // ✅ Language changed by another user in the room. Only rebind — the
+    // switcher seeds the starter if the text is empty, and it arrives as a
+    // normal yjs:update. Seeding here too would duplicate it.
     const onLanguageChanged = ({ language: lang }: { language: Language }) => {
       setLanguage(lang);
+      switchLanguage(lang);
       toast.info(`Language switched to ${LANGUAGES[lang]?.label ?? lang}`);
     };
 
@@ -543,10 +553,17 @@ export function EditorPage() {
                   onClick={()=>{
                     setLanguage(key);
                     setLangOpen(false);
-                    
-                    const newStarter = LANGUAGES[key as Language]?.starter ?? '';
-                    setYjsCode(newStarter);
-                    
+
+                    // Rebind to this language's own text. The previous
+                    // language's code is left exactly where it was, so
+                    // switching back restores it. Seed the starter only if
+                    // this language has never been written to.
+                    const existing = switchLanguage(key);
+                    if (existing === '') {
+                      const starter = LANGUAGES[key as Language]?.starter ?? '';
+                      if (starter) setYjsCode(starter);
+                    }
+
                     toast.info(`Switched to ${cfg.label}`);
                     // ✅ Broadcast language change to everyone else in the room
                     getSocket()?.emit(SocketEvents.LANGUAGE_CHANGE, { roomId, language: key });

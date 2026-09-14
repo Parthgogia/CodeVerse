@@ -21,11 +21,22 @@ import { INSTANCE_ID } from "./roomManager.js";
 // whatever is already stored into the local document, and writes the union
 // back. A save can therefore never shrink the stored document, no matter which
 // instance wins the race or how far behind it was.
+//
+// Layout: ONE Y.Text PER LANGUAGE, all inside the same Y.Doc, keyed
+// `code:{language}`. Switching language rebinds the editor to a different text
+// instead of overwriting the only one — which is how switching used to wipe
+// the previous language's code. Because docState is the whole Y.Doc, every
+// language's code rides along through the same save/merge path with no extra
+// bookkeeping. Rooms from before this layout kept their text under the bare
+// key `code`; `load` moves it under the room's current language once.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Key of the Y.Text holding a language's code. Mirrored in web/src/lib/useYjsEditor.ts. */
+export const textKey = (language: string) => `code:${language}`;
+const LEGACY_TEXT_KEY = "code";
 
 interface RoomDoc {
   ydoc:            Y.Doc;
-  ytext:           Y.Text;
   dirty:           boolean;
   saveTimer:       ReturnType<typeof setTimeout> | null;
   lastSnapshotText: string;
@@ -77,27 +88,34 @@ async function load(roomId: string): Promise<RoomDoc> {
   if (inflight) return inflight;
 
   const promise = (async (): Promise<RoomDoc> => {
-    let stored: Uint8Array | null = null;
+    let stored:   Uint8Array | null = null;
+    let language: string | null     = null;
     try {
       const row = await prisma.room.findUnique({
         where:  { id: roomId },
-        select: { docState: true },
+        select: { docState: true, language: true },
       });
       if (row?.docState?.length) stored = new Uint8Array(row.docState);
+      language = row?.language ?? null;
     } catch (err: any) {
       console.error(`[docs] Failed to load ${roomId}:`, err?.message);
     }
 
     const ydoc = new Y.Doc();
     if (stored) Y.applyUpdate(ydoc, stored);
-    const ytext = ydoc.getText("code");
+
+    // One-time move of pre-per-language content. Must finish before any client
+    // sees this state: a client that found its language's text empty would seed
+    // the starter template, and a later migration would then land on top of it.
+    if (language && ydoc.getText(LEGACY_TEXT_KEY).length > 0) {
+      await migrateLegacyText(roomId, ydoc, language);
+    }
 
     const doc: RoomDoc = {
       ydoc,
-      ytext,
       dirty:            false,
       saveTimer:        null,
-      lastSnapshotText: ytext.toString(),
+      lastSnapshotText: language ? ydoc.getText(textKey(language)).toString() : "",
       lastSnapshotAt:   Date.now(),
     };
 
@@ -110,6 +128,39 @@ async function load(roomId: string): Promise<RoomDoc> {
   return promise;
 }
 
+// ── Legacy migration ──────────────────────────────────────
+// Moves text from the bare `code` key under `code:{language}`. This is the one
+// place the server creates CRDT operations from plain text, so it runs under
+// the save lock and re-reads the stored state first: if another instance got
+// here first, the legacy text is already empty and there is nothing to do.
+// Without the lock two instances could both move it and merge into two copies.
+async function migrateLegacyText(roomId: string, ydoc: Y.Doc, language: string): Promise<void> {
+  const holdsLock = await acquireSaveLock(roomId, true);
+  if (!holdsLock) console.warn(`[docs] Migrating ${roomId} without the save lock`);
+  try {
+    const row = await prisma.room.findUnique({ where: { id: roomId }, select: { docState: true } });
+    if (row?.docState?.length) Y.applyUpdate(ydoc, new Uint8Array(row.docState));
+
+    const legacy = ydoc.getText(LEGACY_TEXT_KEY);
+    if (legacy.length === 0) return;                    // someone else migrated it
+
+    const target = ydoc.getText(textKey(language));
+    ydoc.transact(() => {
+      if (target.length === 0) target.insert(0, legacy.toString());
+      legacy.delete(0, legacy.length);
+    });
+    await prisma.room.update({
+      where: { id: roomId },
+      data:  { docState: Buffer.from(Y.encodeStateAsUpdate(ydoc)) },
+    });
+    console.log(`[docs] Migrated ${roomId} to per-language text (${language})`);
+  } catch (err: any) {
+    console.error(`[docs] Legacy migration failed for ${roomId}:`, err?.message);
+  } finally {
+    if (holdsLock) await getRedis().del(saveLockKey(roomId)).catch(() => {});
+  }
+}
+
 // ── Save ──────────────────────────────────────────────────
 function scheduleSave(roomId: string, doc: RoomDoc, delay = SAVE_DEBOUNCE_MS): void {
   if (doc.saveTimer) clearTimeout(doc.saveTimer);
@@ -118,6 +169,16 @@ function scheduleSave(roomId: string, doc: RoomDoc, delay = SAVE_DEBOUNCE_MS): v
     void persist(roomId, doc, false);
   }, delay);
   doc.saveTimer.unref?.();
+}
+
+/** Cheap pre-check for a clean document: could any language's text owe a snapshot? */
+function anyTextChangedSince(doc: RoomDoc): boolean {
+  for (const key of doc.ydoc.share.keys()) {
+    if (!key.startsWith("code:")) continue;
+    const text = doc.ydoc.getText(key).toString();
+    if (text.trim() && text !== doc.lastSnapshotText) return true;
+  }
+  return false;
 }
 
 /** Is a new history row due for this text? */
@@ -130,7 +191,9 @@ async function persist(roomId: string, doc: RoomDoc, final: boolean): Promise<bo
   // `dirty` only tracks the CRDT state. The history row can still be owed even
   // when the state is already saved — a debounced save clears `dirty` but is
   // rate-limited out of writing a snapshot, and the final flush must catch up.
-  if (!doc.dirty && !snapshotDue(doc, doc.ytext.toString(), final)) return true;
+  // The current language is only known after the read below, so the clean-doc
+  // shortcut checks every language's text against the last snapshot instead.
+  if (!doc.dirty && !final && !anyTextChangedSince(doc)) return true;
 
   let holdsLock = false;
 
@@ -145,9 +208,11 @@ async function persist(roomId: string, doc: RoomDoc, final: boolean): Promise<bo
     // Merge in whatever another instance stored while we were editing, so the
     // write is a union rather than an overwrite. This is what makes the order
     // of concurrent saves irrelevant: a save can never shrink the document.
+    // `language` is read here rather than cached: another instance may have
+    // changed it, and the history row should be of the language people see.
     const row = await prisma.room.findUnique({
       where:  { id: roomId },
-      select: { docState: true },
+      select: { docState: true, language: true },
     });
     if (row === null) {             // room deleted underneath us
       forget(roomId);
@@ -157,7 +222,7 @@ async function persist(roomId: string, doc: RoomDoc, final: boolean): Promise<bo
 
     // Recompute after the merge — the union may differ from what we had.
     const state = Y.encodeStateAsUpdate(doc.ydoc);
-    const text  = doc.ytext.toString();
+    const text  = doc.ydoc.getText(textKey(row.language)).toString();
 
     await prisma.room.update({
       where: { id: roomId },
@@ -214,10 +279,10 @@ export const RoomDocs = {
     return Y.encodeStateAsUpdate(doc.ydoc);
   },
 
-  /** Plain text of the document — used for the room:state text fallback. */
-  async getText(roomId: string): Promise<string> {
+  /** Plain text of one language's code — used for the room:state text fallback. */
+  async getText(roomId: string, language: string): Promise<string> {
     const doc = await load(roomId);
-    return doc.ytext.toString();
+    return doc.ydoc.getText(textKey(language)).toString();
   },
 
   /** Last local participant left: write the document out and free the memory. */

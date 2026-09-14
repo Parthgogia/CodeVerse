@@ -187,8 +187,13 @@ duplicated code. Restoring from identical bytes reproduces identical history, an
 merges are idempotent.
 
 `room:state` therefore carries `doc` — the state a returning client applies
-directly — alongside `code` as a plain-text fallback. A brand-new empty room gets
-its starter template from the first person to open it.
+directly — alongside `code` as a plain-text fallback for the current language.
+
+**Each language has its own text.** The `Y.Doc` holds one `Y.Text` per language
+(`code:python`, `code:javascript`, …). Switching language rebinds the editor to a
+different text; the previous language's code stays exactly where it was and comes
+back when you switch back. A language nobody has written in yet gets its starter
+template the first time someone opens or switches to it.
 
 Concurrent saves are safe without instances gossiping to each other: each save
 takes a short Redis lock, merges whatever is already stored into its own document,

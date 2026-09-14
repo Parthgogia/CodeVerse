@@ -14,6 +14,12 @@ interface AwarenessState {
 
 const PALETTE = ['#5b4ef0','#10b981','#f59e0b','#f43f5e','#8b5cf6','#22d3ee','#ec4899','#f97316'];
 
+// One Y.Text per language, all inside the same Y.Doc. Switching language
+// rebinds the editor to another text instead of overwriting the only one —
+// which is how a switch used to erase the previous language's code.
+// Mirrored in backend/src/realtime/roomDocs.ts.
+const textKey = (language: string) => `code:${language}`;
+
 function colorForUser(id: string): string {
   let h = 0;
   for (let i = 0; i < id.length; i++) h = (h + id.charCodeAt(i)) & 0xffffffff;
@@ -64,6 +70,10 @@ interface YjsEditorReturn {
   initializeCode:   (code: string) => void;
   setCode:          (code: string) => void;
   applyServerState: (update: number[]) => void;
+  /** Rebind the editor to `language`'s text. Returns that text (empty = never written). */
+  switchLanguage:   (language: string) => string;
+  /** Current language's text, straight from the CRDT. */
+  getText:          () => string;
   bindEditor:       (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof import('monaco-editor')) => void;
   unbindEditor:     () => void;
 }
@@ -71,6 +81,8 @@ interface YjsEditorReturn {
 export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): YjsEditorReturn {
   const ydocRef        = useRef<Y.Doc | null>(null);
   const ytextRef       = useRef<Y.Text | null>(null);
+  const languageRef    = useRef<string>('python');
+  const observerRef    = useRef<(() => void) | null>(null);
   const editorRef      = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const monacoRef      = useRef<typeof import('monaco-editor') | null>(null);
   const decorationsRef = useRef<Map<string, string[]>>(new Map());
@@ -83,7 +95,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
   useEffect(() => {
     if (!enabled) return;
     const ydoc  = new Y.Doc();
-    const ytext = ydoc.getText('code');
+    const ytext = ydoc.getText(textKey(languageRef.current));
     ydocRef.current  = ydoc;
     ytextRef.current = ytext;
     initialized.current = false;
@@ -237,6 +249,38 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     onCodeChange?.(code);
   }, [roomId, onCodeChange]);
 
+  // ── switchLanguage ─────────────────────────────────────
+  // Nothing is deleted or inserted here: the previous language's text stays in
+  // the document untouched, the editor simply starts showing a different one.
+  // If the editor is bound, its observer moves to the new text and Monaco is
+  // set to that text's content under suppression so nothing echoes back.
+  const switchLanguage = useCallback((language: string): string => {
+    languageRef.current = language;
+    const ydoc = ydocRef.current;
+    if (!ydoc) return '';
+
+    const prev = ytextRef.current;
+    const next = ydoc.getText(textKey(language));
+    if (prev === next) return next.toString();
+
+    const observer = observerRef.current;
+    if (observer && prev) prev.unobserve(observer);
+    ytextRef.current = next;
+    if (observer) next.observe(observer);
+
+    const text   = next.toString();
+    const editor = editorRef.current;
+    const model  = editor?.getModel();
+    if (model && model.getValue() !== text) {
+      suppressMonaco.current = true;
+      try { model.setValue(text); } finally { suppressMonaco.current = false; }
+    }
+    onCodeChange?.(text);
+    return text;
+  }, [onCodeChange]);
+
+  const getText = useCallback((): string => ytextRef.current?.toString() ?? '', []);
+
   // ── Remote cursor rendering ────────────────────────────
   const renderRemoteCursor = useCallback((state: AwarenessState) => {
     const editor = editorRef.current;
@@ -305,6 +349,8 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     if (!ytext) return;
 
     // ── Yjs → Monaco ─────────────────────────────────────
+    // Reads ytextRef at call time, not the `ytext` captured above, because
+    // switchLanguage re-points it and moves this observer to the new text.
     const onYjsChange = () => {
       if (suppressYjs.current) return;
       const model = editor.getModel();
@@ -312,7 +358,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
 
       suppressMonaco.current = true;
       try {
-        const newText = ytext.toString();
+        const newText = ytextRef.current?.toString() ?? '';
         if (model.getValue() !== newText) {
           const pos = editor.getPosition();
           model.setValue(newText);
@@ -325,6 +371,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     };
 
     ytext.observe(onYjsChange);
+    observerRef.current = onYjsChange;
 
     // ✅ Initial sync — if initializeCode was called before the editor mounted,
     // Y.Text already has content; push it into Monaco now so they're in sync
@@ -344,7 +391,8 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
 
       suppressYjs.current = true;
       try {
-        const ydoc = ydocRef.current!;
+        const ydoc  = ydocRef.current!;
+        const ytext = ytextRef.current!;       // current language's text
         ydoc.transact(() => {
           const sorted = [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
           for (const ch of sorted) {
@@ -410,6 +458,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       const observer = (editor as any).__yjsObserver;
       if (observer && ytext) ytext.unobserve(observer);
     }
+    observerRef.current = null;
 
     decorationsRef.current.forEach((_, id) => clearRemoteCursor(id));
     decorationsRef.current.clear();
@@ -418,5 +467,5 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     monacoRef.current = null;
   }, [clearRemoteCursor]);
 
-  return { initializeCode, setCode, applyServerState, bindEditor, unbindEditor };
+  return { initializeCode, setCode, applyServerState, switchLanguage, getText, bindEditor, unbindEditor };
 }
