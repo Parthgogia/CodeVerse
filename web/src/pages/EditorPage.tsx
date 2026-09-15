@@ -304,7 +304,7 @@ export function EditorPage() {
     };
 
     const onRoomState = (state: {
-      code: string; doc?: number[]; users: ConnectedUser[]; language?: Language;
+      code: string; doc?: ArrayBuffer | number[]; users: ConnectedUser[]; language?: Language;
     }) => {
       // ✅ Update language from room:state so new joiners always see the current
       // language even if someone changed it after the room was first created.
@@ -314,9 +314,10 @@ export function EditorPage() {
       if (state.language) setLanguage(state.language);
       switchLanguage(lang);
 
-      if (state.doc && state.doc.length > 2) {
+      if (state.doc) {
         // The room has saved work — restore it from the server's CRDT state.
-        // This is what makes a room survive everyone leaving.
+        // This is what makes a room survive everyone leaving. (An empty doc is
+        // 2 bytes; applyServerState ignores it.)
         applyServerState(state.doc);
       }
 

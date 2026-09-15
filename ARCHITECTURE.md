@@ -364,7 +364,7 @@ sequenceDiagram
 The join handler authorizes **again** even though REST already did. The socket is a
 separate entry point and must never rely on the client having asked politely first.
 
-### 5.2 Collaborative editing ✅ ⚠️
+### 5.2 Collaborative editing ✅
 
 ```mermaid
 sequenceDiagram
@@ -375,24 +375,46 @@ sequenceDiagram
     participant B as Client B
 
     A->>A: Monaco onDidChangeModelContent
-    A->>A: apply into local Y.Text inside a transaction
-    A->>SA: yjs:update { update: number[] }
+    A->>A: ydoc.transact(apply into Y.Text, origin 'local')
+    A->>A: ydoc.on('update') → incremental diff (tens of bytes)
+    A->>SA: yjs:update { update: <binary> }  (with ack)
     SA->>SA: isInRoom? rate limit?
-    SA-->>SB: relay via Redis adapter
-    SB-->>B: yjs:update
-    B->>B: Y.applyUpdate → Monaco model updated
+    SA-->>A: ack { ok } — or { ok:false, retryAfterMs } if rate-limited
+    SA-->>SB: relay the bytes via Redis adapter
+    SB-->>B: yjs:update (binary frame)
+    B->>B: Y.applyUpdate(…, origin 'remote') → Monaco model updated
     SA->>SA: RoomDocs.applyUpdate → fold into server's Y.Doc
     SA->>SA: mark dirty, debounce a save (4s)
 ```
 
-⚠️ **The client sends the entire document state on every keystroke.**
-`useYjsEditor` calls `Y.encodeStateAsUpdate(ydoc)` — a full state vector — rather than
-the incremental diff Yjs hands you from the `update` event, and serialises it as a JSON
-array of numbers (roughly 3–4× the byte cost of the binary form). For a 200-line file
-that is a few KB per keypress. It is correct — Yjs merges are idempotent, so re-sending
-known state is harmless — but it is O(document) per keystroke where it should be
-O(change). The fix is to subscribe to `ydoc.on('update', ...)` and relay that buffer,
-which is also what makes the server-side doc cheaper to maintain.
+**Wire format: incremental and binary.** Each local transaction produces an update
+buffer via `ydoc.on('update')`; that buffer — O(change), typically 20–40 bytes for a
+keystroke — is sent as a `Uint8Array`, which Socket.IO carries as a binary WebSocket frame.
+Measured on a 2.5 KB document: **27 bytes per keystroke**, against ≥ 10 KB for the
+previous format (full `Y.encodeStateAsUpdate(ydoc)` serialised as a JSON `number[]`).
+`room:state.doc` is binary too. The server accepts both shapes — `Buffer` from current
+clients, `number[]` from older ones and harnesses — and relays the raw bytes.
+
+**Transaction origins are what stop the echo.** Local edits, starter seeding and
+programmatic `setCode` are transacted with origin `'local'`; only those reach the
+`update` listener that sends. Anything applied from the network is tagged `'remote'` and
+never re-sent; `initializeCode` uses `'silent'` (written locally, deliberately not
+broadcast).
+
+**Dropped updates are healed, not ignored.** This is the one thing incremental updates
+make harder. A full-state update that was rate-limited was harmless — the next one
+carried everything. An incremental update that is dropped leaves every peer with a
+permanent gap: Yjs parks later updates from that client as *pending* until the missing
+one arrives, and the server's own document has the same hole. So `yjs:update` is now
+acknowledged. A rate-limited ack carries `retryAfterMs` (the limiter's window TTL, the
+same `rateLimitRetryAfter` used for `Retry-After` on `POST /execute`), and the client
+schedules exactly one full-state resend for just after the window resets. That resend is
+idempotent and fills the gap on every peer and on the server. Verified: 260 edits fired
+in one burst against a 200/10s limit → the peer showed 200, then converged at the 10 s
+mark; the state reloaded from Postgres afterwards was byte-identical.
+
+The one deliberate full-state send that remains is the peer push on `room:user-joined` —
+once per arrival, so its cost is irrelevant.
 
 ### 5.3 Code execution ✅
 
@@ -969,6 +991,7 @@ environment variables; 🔲 everything else is a compile-time constant.
 | Departure grace period | 3 s | `room.handlers.ts` |
 | Socket ping timeout / interval | 20 s / 10 s | `socket.ts` |
 | Max socket message | 5 MB | `socket.ts` |
+| Resync after rate-limited `yjs:update` | window TTL + 250 ms (fallback 1.5 s) | `useYjsEditor.ts` |
 | JWT lifetime | 7 days | `auth.controller.ts` |
 | bcrypt cost | 10 | `auth.controller.ts` |
 | HTTP job poll interval / cap | 900 ms / ~60 s | `useJobPoller.ts` |
@@ -981,7 +1004,8 @@ Ordered by how much they would hurt in production.
 
 1. ~~Fix TypeScript execution~~ ✅ — done; runs from a local `codeverse-sandbox-ts` image with `tsx` baked in.
 2. ~~Apply the execution rate limit~~ ✅ — done; `POST /api/execute` returns 429 with `Retry-After`.
-3. **Send incremental Yjs updates as binary** ⚠️ — the single biggest bandwidth win.
+3. ~~Send incremental Yjs updates as binary~~ ✅ — done; 27 bytes per keystroke measured,
+   with ack-driven resync for rate-limited drops (§5.2).
 4. **Split the worker from the API** ⚠️ — so execution load cannot starve WebSocket traffic.
 5. ~~Delete `app.ts` and `user.routes.ts`~~ ✅ — removed. They were an unmounted early
    scaffold that wrote plaintext passwords and served an unauthenticated user list; never

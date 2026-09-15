@@ -141,13 +141,13 @@ Frontend runs on **http://localhost:5173**. All `/api` and `/socket.io` requests
 |------------------|--------------------|------------------------------------------------|
 | Client → Server  | `room:join`        | `{ roomId }`                                   |
 | Client → Server  | `room:leave`       | `{ roomId }`                                   |
-| Client → Server  | `yjs:update`       | `{ roomId, update: number[] }` (binary diff)   |
+| Client → Server  | `yjs:update`       | `{ roomId, update: <binary> }` incremental diff; acked `{ ok }` or `{ ok:false, reason, retryAfterMs }` |
 | Client → Server  | `yjs:awareness`    | `{ roomId, state: AwarenessState }`            |
 | Client → Server  | `code:change`      | `{ roomId, content }` (plain-text fallback)    |
-| Server → Client  | `room:state`       | `{ code, doc: number[], users, language }`     |
+| Server → Client  | `room:state`       | `{ code, doc: <binary>, users, language }`     |
 | Server → Client  | `room:user-joined` | `{ id, userId, username, color }`              |
 | Server → Client  | `room:user-left`   | `{ userId, username }`                         |
-| Server → Client  | `yjs:update`       | `{ update: number[] }` (relayed diff)          |
+| Server → Client  | `yjs:update`       | `{ update: <binary> }` (relayed diff)          |
 | Server → Client  | `yjs:awareness`    | `AwarenessState` (relayed cursor)              |
 | Server → Client  | `code:run-result`  | `{ stdout, stderr, exitCode, executionTimeMs }`|
 | Server → Client  | `room:deleted`     | `{ roomId, name }` (owner deleted the room)    |
@@ -283,11 +283,11 @@ public images are pulled on first use; the TypeScript image must be built once w
 
 ## How real-time sync works
 
-1. User joins a room → server sends `room:state` with latest snapshot code
-2. `initializeCode()` seeds the local `Y.Doc` with that code
-3. Every Monaco `onDidChangeModelContent` event is transacted into the `Y.Doc`, encoded as a binary Yjs update, and emitted as `yjs:update`
-4. Server relays the binary diff to all other clients in the room
-5. Recipients apply the update via `Y.applyUpdate()`, which syncs Monaco
+1. User joins a room → server sends `room:state` with the persisted Yjs state (`doc`, binary) and the current language
+2. The client binds the editor to that language's `Y.Text` and applies `doc`
+3. Every Monaco `onDidChangeModelContent` event is transacted into the `Y.Doc` with origin `'local'`; the resulting **incremental** update (tens of bytes, not the whole document) is emitted as a binary `yjs:update`
+4. Server acks it and relays the bytes to all other clients in the room. If the update was rate-limited, the ack says when the window resets and the client resends its full state once, just after — so a dropped diff never leaves peers with a gap
+5. Recipients apply the update via `Y.applyUpdate()` with origin `'remote'` (never re-sent), which syncs Monaco
 6. Cursor positions + selections are broadcast as `yjs:awareness` events and rendered as Monaco decorations with per-user colors
 
 ## Rate limits (Redis)

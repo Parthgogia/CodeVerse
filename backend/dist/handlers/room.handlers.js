@@ -186,7 +186,7 @@ async function sendRoomState(socket, roomId, userId, language) {
     ]);
     socket.emit("room:state", {
         code,
-        doc: Array.from(doc),
+        doc: Buffer.from(doc), // binary frame, not a JSON number[]
         users,
         language: lang,
     });

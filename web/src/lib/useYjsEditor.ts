@@ -14,6 +14,34 @@ interface AwarenessState {
 
 const PALETTE = ['#5b4ef0','#10b981','#f59e0b','#f43f5e','#8b5cf6','#22d3ee','#ec4899','#f97316'];
 
+// ── Wire format ──────────────────────────────────────────
+// Every local transaction produces an incremental update via ydoc.on('update');
+// that buffer — O(change), not O(document) — is what goes over the socket, as a
+// Uint8Array so Socket.IO sends a binary frame instead of a JSON number[].
+// Transaction origins keep the loop from echoing: only LOCAL-origin updates are
+// sent; anything applied from the network is tagged REMOTE and never re-sent.
+const LOCAL  = 'local';
+const REMOTE = 'remote';
+const SILENT = 'silent';   // written locally but deliberately not broadcast
+
+// Incremental updates have one weakness: if one is dropped (rate limited), peers
+// park every later update as "pending" until the gap is filled. The server acks
+// each update; a rate-limited ack says when the window resets, and one full-state
+// resend is scheduled for just after that — a full state carries everything that
+// was missed. The fallback delay only applies if the ack carries no timing.
+const RESYNC_FALLBACK_MS = 1_500;
+const RESYNC_SLACK_MS    = 250;
+
+type WireBytes = Uint8Array | ArrayBuffer | number[];
+
+/** Socket.IO hands binary to the browser as ArrayBuffer; old clients/harnesses send number[]. */
+function toBytes(u: unknown): Uint8Array {
+  if (u instanceof Uint8Array)  return u;
+  if (u instanceof ArrayBuffer) return new Uint8Array(u);
+  if (Array.isArray(u))         return Uint8Array.from(u);
+  return new Uint8Array(0);
+}
+
 // One Y.Text per language, all inside the same Y.Doc. Switching language
 // rebinds the editor to another text instead of overwriting the only one —
 // which is how a switch used to erase the previous language's code.
@@ -69,7 +97,7 @@ interface Options {
 interface YjsEditorReturn {
   initializeCode:   (code: string) => void;
   setCode:          (code: string) => void;
-  applyServerState: (update: number[]) => void;
+  applyServerState: (update: WireBytes) => void;
   /** Rebind the editor to `language`'s text. Returns that text (empty = never written). */
   switchLanguage:   (language: string) => string;
   /** Current language's text, straight from the CRDT. */
@@ -90,6 +118,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
   const suppressYjs    = useRef(false);
   const suppressMonaco = useRef(false);
   const initialized    = useRef(false);
+  const resyncTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Create Y.Doc on mount ──────────────────────────────
   useEffect(() => {
@@ -113,12 +142,33 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     if (!enabled || !user) return;
     const socket = connectSocket();
 
-    const onYjsUpdate = ({ update }: { update: number[] }) => {
+    // ── outbound ──
+    const send = (update: Uint8Array) => {
+      socket.emit('yjs:update', { roomId, update }, (ack?: { ok: boolean; reason?: string; retryAfterMs?: number }) => {
+        if (ack?.ok === false && ack.reason === 'rate-limited') scheduleResync(ack.retryAfterMs);
+      });
+    };
+    const scheduleResync = (retryAfterMs?: number) => {
+      if (resyncTimer.current) return;             // one resync covers every drop in the window
+      const delay = (retryAfterMs ?? RESYNC_FALLBACK_MS) + RESYNC_SLACK_MS;
+      resyncTimer.current = setTimeout(() => {
+        resyncTimer.current = null;
+        const ydoc = ydocRef.current;
+        if (ydoc) send(Y.encodeStateAsUpdate(ydoc));   // full state fills any gap
+      }, delay);
+    };
+    const onLocalUpdate = (update: Uint8Array, origin: unknown) => {
+      if (origin === LOCAL) send(update);
+    };
+    ydocRef.current?.on('update', onLocalUpdate);
+
+    // ── inbound ──
+    const onYjsUpdate = ({ update }: { update: WireBytes }) => {
       const ydoc = ydocRef.current;
       if (!ydoc) return;
       suppressMonaco.current = true;
-      Y.applyUpdate(ydoc, new Uint8Array(update));
-      suppressMonaco.current = false;
+      try { Y.applyUpdate(ydoc, toBytes(update), REMOTE); }
+      finally { suppressMonaco.current = false; }
     };
 
     const onAwareness = (state: AwarenessState) => {
@@ -131,15 +181,13 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     };
 
     // ✅ When a new user joins, broadcast our full document state so they
-    // immediately receive the current code without needing a keystroke.
+    // immediately receive the current code without needing a keystroke. This is
+    // the one deliberate full-state send left; it is rare (once per arrival).
     const onUserJoined = () => {
       const ydoc = ydocRef.current;
       if (!ydoc) return;
       const fullUpdate = Y.encodeStateAsUpdate(ydoc);
-      if (fullUpdate.length > 2) {
-        // Only emit if doc is non-empty (Yjs empty doc is 2 bytes)
-        socket.emit('yjs:update', { roomId, update: Array.from(fullUpdate) });
-      }
+      if (fullUpdate.length > 2) send(fullUpdate);   // empty Y.Doc encodes to 2 bytes
     };
 
     socket.on('yjs:update',       onYjsUpdate);
@@ -148,6 +196,8 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     socket.on('room:user-joined', onUserJoined);
 
     return () => {
+      ydocRef.current?.off('update', onLocalUpdate);
+      if (resyncTimer.current) { clearTimeout(resyncTimer.current); resyncTimer.current = null; }
       socket.off('yjs:update',       onYjsUpdate);
       socket.off('yjs:awareness',    onAwareness);
       socket.off('room:user-left',   onUserLeft);
@@ -165,8 +215,10 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     try {
       const current = ytext.toString();
       if (current !== code) {
-        ytext.delete(0, ytext.length);
-        if (code) ytext.insert(0, code);
+        ytext.doc!.transact(() => {
+          ytext.delete(0, ytext.length);
+          if (code) ytext.insert(0, code);
+        }, SILENT);
       }
     } finally {
       suppressYjs.current = false;
@@ -191,15 +243,16 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
   // bytes rather than text on purpose: applying the identical CRDT operations
   // reproduces the document exactly, whereas re-typing the text as a fresh
   // insert would duplicate content the moment it merged with anyone else's copy.
-  const applyServerState = useCallback((update: number[]) => {
-    const ydoc = ydocRef.current;
+  const applyServerState = useCallback((update: WireBytes) => {
+    const ydoc  = ydocRef.current;
+    const bytes = toBytes(update);
     // An empty Y.Doc encodes to 2 bytes — nothing to restore.
-    if (!ydoc || !update || update.length <= 2) return;
+    if (!ydoc || bytes.length <= 2) return;
 
     initialized.current    = true;
     suppressMonaco.current = true;
     try {
-      Y.applyUpdate(ydoc, new Uint8Array(update));
+      Y.applyUpdate(ydoc, bytes, REMOTE);
     } finally {
       suppressMonaco.current = false;
     }
@@ -222,15 +275,11 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
     
     suppressYjs.current = true;
     try {
-      ytext.delete(0, ytext.length);
-      if (code) ytext.insert(0, code);
-      
-      const ydoc = ydocRef.current;
-      if (ydoc) {
-        const socket = connectSocket();
-        const update = Y.encodeStateAsUpdate(ydoc);
-        socket.emit('yjs:update', { roomId, update: Array.from(update) });
-      }
+      // LOCAL origin → the 'update' listener sends the incremental diff.
+      ytext.doc!.transact(() => {
+        ytext.delete(0, ytext.length);
+        if (code) ytext.insert(0, code);
+      }, LOCAL);
     } finally {
       suppressYjs.current = false;
     }
@@ -247,7 +296,7 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
 
     // Ensure consumers (e.g. EditorPage) receive the programmatic update
     onCodeChange?.(code);
-  }, [roomId, onCodeChange]);
+  }, [onCodeChange]);
 
   // ── switchLanguage ─────────────────────────────────────
   // Nothing is deleted or inserted here: the previous language's text stays in
@@ -393,16 +442,14 @@ export function useYjsEditor({ roomId, user, enabled, onCodeChange }: Options): 
       try {
         const ydoc  = ydocRef.current!;
         const ytext = ytextRef.current!;       // current language's text
+        // LOCAL origin → the 'update' listener sends just this transaction's diff.
         ydoc.transact(() => {
           const sorted = [...e.changes].sort((a, b) => b.rangeOffset - a.rangeOffset);
           for (const ch of sorted) {
             if (ch.rangeLength > 0) ytext.delete(ch.rangeOffset, ch.rangeLength);
             if (ch.text)            ytext.insert(ch.rangeOffset, ch.text);
           }
-        });
-
-        const update = Y.encodeStateAsUpdate(ydoc);
-        socket.emit('yjs:update', { roomId, update: Array.from(update) });
+        }, LOCAL);
         onCodeChange?.(ytext.toString());
       } finally {
         suppressYjs.current = false;
