@@ -1,18 +1,110 @@
 # CodeVerse
 
-Real-time collaborative code editor with live cursors, CRDT sync, Docker-sandboxed execution, and auto-scaled workers.
+Real-time collaborative code editor with live cursors, CRDT sync, Docker-sandboxed execution, persistent rooms, and a load-balanced multi-instance backend.
 
 ## Stack
 
 | Layer        | Technology                                      |
 |--------------|-------------------------------------------------|
 | Frontend     | React + TypeScript, Monaco Editor, Yjs, Vite    |
-| Realtime     | Socket.IO, Yjs CRDT, awareness protocol         |
+| Realtime     | Socket.IO (Redis adapter), Yjs CRDT, cursor awareness |
 | Backend API  | Express + TypeScript, JWT auth                  |
 | Queue        | BullMQ + Redis                                  |
-| Execution    | Docker (one container per run)                  |
+| Execution    | Docker (one throwaway container per run)        |
 | Database     | PostgreSQL via Prisma ORM                       |
-| State cache  | Redis (rate limiting, BullMQ)                   |
+| Coordination | Redis (pub/sub, presence, save locks, rate limits, job queue) |
+| Edge (prod)  | Caddy — TLS, static site, load balancer with health checks |
+
+## Features
+
+### Collaborative editing
+
+- **Real-time co-editing** of one document by any number of people, powered by a Yjs CRDT.
+  Every editor holds its own replica; edits merge deterministically with no locking, no
+  "last write wins", and no lost keystrokes even when two people type in the same line.
+- **Live cursors and selections** for everyone in the room, each in their own colour with
+  a name label. Identity is stamped server-side, so nobody can impersonate another user's
+  cursor.
+- **Cheap on the wire.** Each keystroke sends only the CRDT diff for that change as a
+  binary frame (about 27 bytes on a 2.5 KB file), not the whole document. If the server
+  ever has to drop an update (rate limit), it tells the client when to resend its full
+  state, so peers never end up stuck with a gap.
+- **Monaco editor** (the VS Code editor) with syntax highlighting per language and
+  `Ctrl+Enter` to run.
+
+### Rooms
+
+- **Create a room** with a name, description, language and visibility; it gets an 8-character
+  code. **Join by code** from the dashboard.
+- **Public or private.** Public rooms are open to any signed-in user who has the code;
+  private rooms are owner-only. The rule is enforced in one place and applied to the REST
+  API, the WebSocket join, and code execution alike — REST and realtime can never disagree.
+- **Presence** — who's in the room, live. Joining and leaving is announced with toasts;
+  a page refresh, a brief reconnect or opening a second tab does not produce phantom
+  "left / joined" noise (3-second grace period, per-connection join, per-person leave).
+- **Delete a room** (owner only) from the dashboard or from inside the room; everyone
+  inside is notified and redirected, on every backend instance.
+
+### Persistence
+
+- **Rooms keep their code.** The document survives everyone leaving, a server restart,
+  and being edited on two backend instances at once. What's stored is the binary CRDT
+  state, so restores are exact and merges are idempotent.
+- **Per-language code.** Each room holds a separate document per language. Switch from
+  Python to JavaScript and you get JavaScript's own text (a starter template the first
+  time); switch back and your Python is exactly as you left it.
+- **Automatic saving** 4 seconds after the last edit, on the last person leaving, and on
+  shutdown. Concurrent saves from different instances are merged under a lock, never
+  overwritten.
+- **History** — a plain-text snapshot is kept at most once a minute per room, plus one
+  when the room empties (`GET /api/rooms/:id/snapshots`).
+
+### Code execution
+
+- **Run code in five languages** — JavaScript, TypeScript, Python, C++ and Java — with
+  output streamed back to everyone in the room. Results arrive over the socket, with an
+  HTTP polling fallback if the socket drops mid-run.
+- **Every run is sandboxed** in its own throwaway Docker container: no network, read-only
+  filesystem, a small tmpfs scratch space, and no host mounts (the code is piped in over
+  stdin).
+- **Resource limits that actually bite:** 10 s wall clock (the container is killed by
+  name, not just the client), 256 MB memory (OOM-killed with a readable message), half a
+  CPU, 64 processes (fork-bomb guard), a kernel CPU-seconds backstop for containers whose
+  parent process died, a 64 KB output cap (the run is stopped, not the server), and a
+  64 KB limit on submitted code. All tunable via `EXEC_*` environment variables.
+- **Orphan reaper** — containers left behind by a crashed or restarted backend are swept
+  up automatically, so an infinite loop can never pin a core forever.
+- **Fair use:** 5 runs per 30 seconds per user; over that you get a `429` with a
+  `Retry-After` telling you how long to wait.
+
+### Accounts and security
+
+- **Register / log in** with email and password (bcrypt-hashed), 7-day JWT sessions. The
+  same token authenticates both REST calls and the WebSocket handshake.
+- **Rate limiting** on every hot path — edits, cursor moves, room joins and code runs —
+  per user, backed by Redis. Fails open if Redis blips, so a cache hiccup never stops
+  editing.
+- **Server-authoritative identity** for cursors and presence; clients cannot spoof
+  another user.
+
+### Scaling and operations
+
+- **Horizontally scalable backend.** Any number of instances behind a load balancer:
+  broadcasts fan out across instances over Redis pub/sub, presence and save locks live in
+  Redis, and a job run by one instance's worker reaches users connected to another. No
+  sticky sessions needed — the client is WebSocket-only.
+- **Crash-safe presence.** Each instance heartbeats; if one dies, its ghost users are
+  pruned within 30 s.
+- **Production mode in one command** (`docker compose --profile prod up -d --build`): two
+  backend containers, an edge container (Caddy) that terminates TLS, serves the built
+  frontend and load-balances with active health checks, and a one-shot migration.
+- **Real health checks.** `/health/live` ("is the process up?") and `/health/ready`
+  ("should traffic come here?" — checks Postgres and Redis with timeouts). The load
+  balancer only routes to instances that are ready.
+- **Graceful draining.** Stopping an instance first pulls it out of rotation, then closes
+  connections, then flushes every open document — users on it reconnect to another
+  instance and keep editing. No edits lost, no ghost presence.
+- **Every response carries `X-Instance-Id`**, so you can see which instance served you.
 
 ## Project structure
 
@@ -23,19 +115,21 @@ Real-time collaborative code editor with live cursors, CRDT sync, Docker-sandbox
 │   │   ├── config/          redis.ts
 │   │   ├── controllers/     auth, room, exec
 │   │   ├── middleware/       auth JWT guard
-│   │   ├── queues/           execQueue (BullMQ), dockerRunner
+│   │   ├── queues/           execQueue (BullMQ), dockerRunner (sandbox + limits + reaper)
 │   │   ├── realtime/
 │   │   │   ├── handlers/    room, code, cursor
 │   │   │   ├── roomDocs     server-side Y.Doc + persistence
 │   │   │   ├── roomManager  Redis-backed presence
 │   │   │   ├── rateLimiter  Redis INCR+EXPIRE
 │   │   │   └── socket.ts    Socket.IO server + auth + Redis adapter
-│   │   ├── routes/          auth, room, exec
-│   │   ├── services/        roomAccess (room authorization)
+│   │   ├── routes/          auth, room, exec, health
+│   │   ├── services/        roomAccess (authorization), health (live/ready/draining)
 │   │   └── server.ts        HTTP + Socket.IO entrypoint
 │   ├── prisma/
 │   │   └── schema.prisma
-│   ├── .env.example
+│   ├── sandbox/             typescript.Dockerfile — the TypeScript runner image
+│   ├── Dockerfile           backend image (prod mode)
+│   ├── .env.example         backend settings (dev mode)
 │   ├── package.json
 │   └── tsconfig.json
 ├── web/
@@ -46,67 +140,135 @@ Real-time collaborative code editor with live cursors, CRDT sync, Docker-sandbox
 │   │   │                    useJobPoller, monacoTheme
 │   │   ├── pages/           Landing, Auth, Dashboard, Editor
 │   │   └── types/           index.ts (all shared types)
-│   ├── .env
+│   ├── .env                 VITE_API_URL / VITE_WS_URL (dev only; unset = same origin)
 │   ├── package.json
 │   └── vite.config.ts
-└── docker-compose.yml       Postgres + Redis for local dev
+├── edge/
+│   ├── Caddyfile            HTTPS, static site, load balancer (prod mode)
+│   └── Dockerfile           builds the web bundle, serves it from Caddy
+├── docker-compose.yml       dev: Postgres + Redis · prod (--profile prod): everything
+└── .env.example             root settings for prod mode (JWT_SECRET, PUBLIC_HOST)
 ```
 
-## Prerequisites
+## Running CodeVerse
 
-- Node.js 20+
-- Docker Desktop (running — required for code execution)
-- pnpm / npm / yarn
+There are **two ways** to run it. Pick one — don't run both at the same time.
 
-## Setup
+| | **Dev mode** | **Prod mode** |
+|---|---|---|
+| Who it's for | writing code, day-to-day | seeing the real deployment shape |
+| Postgres + Redis | Docker | Docker |
+| Backend | your machine, `npm run dev`, port 4000, hot reload | Docker, **two** containers, no ports exposed |
+| Frontend | your machine, Vite, port 5173 | built once, served by the edge container |
+| Address | http://localhost:5173 | **https://localhost** |
+| HTTPS / load balancer / health checks | no | yes (Caddy "edge" container) |
+| Start | 3 terminals | 1 command |
 
-### 1. Start Postgres + Redis
+Both modes share the same Postgres and Redis, so the same users and rooms exist in both.
+
+### Prerequisites (both modes)
+
+- **Docker Desktop**, running. Dev mode needs it for Postgres, Redis and to sandbox code
+  runs; prod mode runs everything in it.
+- **Node.js 20+** and npm — dev mode only.
+
+### Dev mode, step by step
+
+Three things run in three terminals.
+
+**Terminal 1 — databases (Docker):**
 
 ```bash
 docker compose up -d
 ```
 
-Postgres is available at `localhost:5432`, Redis at `localhost:6379`.
+Starts Postgres on `localhost:5432` and Redis on `localhost:6379`. Nothing else.
 
-### 2. Backend
+**Terminal 2 — backend (your machine):**
 
 ```bash
 cd backend
-
-# Install dependencies
 npm install
-
-# Copy and fill in environment variables
-cp .env.example .env
-# Edit .env — DATABASE_URL and JWT_SECRET are required
-
-# Generate Prisma client + push schema to DB
-npm run db:generate
-npm run db:push
-
-# Build the TypeScript sandbox image (once per machine; the other runtime
-# images are pulled automatically on first use)
-npm run sandbox:build
-
-# Start dev server (tsx watch — hot reload)
-npm run dev
+cp .env.example .env      # first time only — DATABASE_URL and JWT_SECRET are required
+npm run db:generate       # first time, and after any prisma/schema.prisma change
+npm run db:push           # first time, and after any schema change (or: npx prisma migrate dev)
+npm run sandbox:build     # first time only — builds the TypeScript runner image
+npm run dev               # http://localhost:4000, hot reload
 ```
 
-Backend listens on **http://localhost:4000**.
-
-### 3. Frontend
+**Terminal 3 — frontend (your machine):**
 
 ```bash
 cd web
-
-# Install dependencies
 npm install
-
-# Start Vite dev server
-npm run dev
+npm run dev               # http://localhost:5173
 ```
 
-Frontend runs on **http://localhost:5173**. All `/api` and `/socket.io` requests are proxied to `:4000` via `vite.config.ts` — no CORS issues in development.
+Open **http://localhost:5173**. Vite proxies `/api` and `/socket.io` to the backend, so
+there are no CORS issues. When you click **Run**, the backend on your machine starts a
+throwaway Docker container for the code.
+
+**To stop dev mode:** `Ctrl+C` in terminals 2 and 3, then `docker compose down` (or leave
+the databases running — they cost nothing).
+
+### Prod mode, step by step
+
+Everything runs in Docker. Nothing runs on your machine directly.
+
+```bash
+# 1. first time only: settings for the containers
+cp .env.example .env
+#    edit .env → set JWT_SECRET to any long random string (PUBLIC_HOST stays localhost)
+
+# 2. build the images and start everything
+docker compose --profile prod up -d --build
+
+# 3. check
+docker compose --profile prod ps                # backend-1 and backend-2 should say "healthy"
+curl -k https://localhost/health/ready          # {"status":"ok", ..., "checks":{"postgres":"ok","redis":"ok",...}}
+```
+
+Open **https://localhost**. The certificate is self-signed, so the browser warns once —
+click through, or trust Caddy's local CA permanently with
+`docker compose exec edge caddy trust`.
+
+What is running, and what each container does:
+
+| Container | Runs | Then |
+|---|---|---|
+| `postgres`, `redis` | the databases | stay up |
+| `migrate` | `prisma migrate deploy` (applies DB migrations) | exits — that's normal |
+| `sandbox-ts` | builds the `codeverse-sandbox-ts` image | exits — that's normal |
+| `backend-1`, `backend-2` | two identical backends (API + sockets + worker) | stay up; **no ports exposed** |
+| `edge` | Caddy: HTTPS on 443, serves the website, sends `/api` + `/socket.io` to whichever backend is healthy | stays up |
+
+`docker compose --profile prod ps` shows `migrate` and `sandbox-ts` as exited — expected.
+
+**To stop prod mode:**
+
+```bash
+docker compose --profile prod down      # stops and removes the containers; data volumes are kept
+```
+
+**After changing backend or web code** in prod mode, rebuild:
+`docker compose --profile prod up -d --build`. (Dev mode hot-reloads instead.)
+
+### Things that trip people up
+
+- **`--profile prod` is the switch.** Without it, compose only knows about Postgres and
+  Redis. With it, it knows about the whole stack. Use it on every command in prod mode:
+  `up`, `ps`, `logs`, `stop`, `down`.
+- **Two `.env` files, two jobs.** `backend/.env` is read by the backend when *you* run it
+  (dev mode). The **root** `.env` is read by docker compose for the containers (prod mode).
+  They don't see each other.
+- **"Failed to start Docker"** on every run → Docker Desktop isn't running.
+- **TypeScript runs fail with "Unable to find image"** → the runner image was never built
+  on this machine: `cd backend && npm run sandbox:build` (dev) or `--build` (prod).
+- **Port 4000 already in use** in dev mode → a previous `npm run dev` is still alive
+  (`tsx watch` survives crashes). Find it with
+  `Get-NetTCPConnection -LocalPort 4000` (PowerShell) and stop that PID.
+- **Prod mode and `npm run dev` at the same time** works technically (the containers
+  publish no ports), but they share the database — keep it simple and pick one.
 
 ## Environment variables
 
@@ -127,6 +289,14 @@ Frontend runs on **http://localhost:5173**. All `/api` and `/socket.io` requests
 | `EXEC_TMPFS_MB`  | `32` — writable scratch space                     |          |
 | `EXEC_MAX_OUTPUT_BYTES` | `65536` — stdout+stderr cap; run is stopped past it |   |
 | `EXEC_MAX_CODE_BYTES`   | `65536` — submitted code cap (`413` above it)  |          |
+| `SHUTDOWN_DRAIN_MS` | `4000` — how long `/health/ready` says 503 before sockets close |   |
+
+### .env (repository root — `prod` profile only)
+
+| Variable | Default | Required |
+|----------|---------|----------|
+| `JWT_SECRET` | — | ✅ |
+| `PUBLIC_HOST` | `localhost` | |
 
 ### web/.env
 
@@ -171,7 +341,13 @@ DELETE /api/rooms/:id            delete room (owner only)
 POST   /api/execute              { roomId, code, language } → { jobId }
                                  413 if code > 64 KB · 429 + Retry-After if > 5 runs / 30 s
 GET    /api/execute/:jobId       poll job status (not rate limited)
+
+GET    /health/live              200 always — process is up
+GET    /health/ready             200 if Postgres + Redis answer and not draining, else 503 with per-check detail
+GET    /api/health               alias of /health/ready
 ```
+
+Every response carries an `X-Instance-Id` header.
 
 ## Persistence
 
@@ -226,10 +402,31 @@ socket `room:join` handler, so REST and realtime can never disagree. `PATCH` and
 `DELETE` remain owner-only. A refused join answers with a `403` (REST) or an
 `error` event (socket) — never a room payload.
 
+## How prod mode works: TLS, load balancer, health checks
+
+(How to *run* it is under [Running CodeVerse](#running-codeverse).) The **edge**
+container (Caddy, `edge/Caddyfile`) on https://localhost:
+
+- terminates TLS (`tls internal` → a local CA; browsers warn until you trust it —
+  `docker compose exec edge caddy trust` prints the root cert; set `PUBLIC_HOST` to a real
+  domain and drop `tls internal` in `edge/Caddyfile` for automatic Let's Encrypt),
+- serves the built SPA (same origin, so the bundle needs no `VITE_*` URLs),
+- load-balances `/api`, `/socket.io` and `/health` across the backends, probing
+  `/health/ready` every 3 s so only ready instances receive traffic.
+
+Backends publish no ports; the edge is the only entry. `docker compose stop backend-1`
+drains it: readiness goes 503, the edge stops routing to it within a probe, sockets
+close after 4 s, documents are flushed, and clients reconnect to the other instance.
+Backends talk to the host Docker daemon through `/var/run/docker.sock` to run code —
+root-equivalent on the host, same as running the backend directly.
+
+Health endpoints (see [API endpoints](#api-endpoints)): `/health/live` says "the process
+is up"; `/health/ready` says "send me traffic" and is what the edge probes.
+
 ## Running more than one instance
 
 Presence and broadcasts are shared through Redis, so instances are interchangeable
-behind a load balancer:
+behind a load balancer (the `prod` profile above runs two):
 
 ```bash
 PORT=4000 npm run dev
@@ -276,7 +473,7 @@ public images are pulled on first use; the TypeScript image must be built once w
 1. User clicks **Run** (or Ctrl+Enter)
 2. Frontend `POST /api/execute` → backend checks code size (`413`), the per-user rate limit (`429` + `Retry-After`), then room access, then enqueues a BullMQ job and returns `jobId`
 3. BullMQ worker picks up the job, calls `dockerRunner.ts`
-4. `dockerRunner` mounts code into a fresh, named container: `--network none --memory 256m --cpus 0.5 --pids-limit 64 --ulimit cpu=10:12 --read-only`
+4. `dockerRunner` pipes the code over stdin into a fresh, named container (`cat > /tmp/main.py && python /tmp/main.py`): `--network none --memory 256m --cpus 0.5 --pids-limit 64 --ulimit cpu=10:12 --read-only`
 5. Limits, all tunable via `EXEC_*` env vars: 10 s wall clock (container is removed by name), 256 MB memory (OOM-killed), 64 KB output (run is stopped), 64 KB code (`413`). A reaper sweeps containers orphaned by a worker restart.
 6. Result `{ stdout, stderr, exitCode, executionTimeMs }` emitted to the entire Socket.IO room via `io.to(roomId).emit('code:run-result', result)`. A limit that fired is explained in `stderr`: exit 124 = timed out, 137 = memory limit, 152 = CPU-time limit, 1 with "Output limit exceeded" = output cap
 7. Frontend socket handler receives result, cancels HTTP poller, updates output panel

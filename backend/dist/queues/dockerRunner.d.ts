@@ -13,6 +13,7 @@ export declare const EXEC_LIMITS: {
     maxOutputBytes: number;
     maxCodeBytes: number;
 };
+export declare function isDockerAvailable(): boolean | null;
 export declare function runInDocker(code: string, language: string, timeoutMs?: number): Promise<ExecResult>;
 /**
  * Removes sandbox containers that have outlived the timeout. Normally there are

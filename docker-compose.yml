@@ -1,4 +1,48 @@
-version: "3.9"
+# ── Two ways to run this file ─────────────────────────────
+#
+#   docker compose up -d
+#     Development: Postgres + Redis only. Run the backend and Vite on the host
+#     (`npm run dev` in backend/ and web/). Unchanged from before.
+#
+#   docker compose --profile prod up -d --build
+#     Production shape on one machine: Postgres, Redis, a one-shot migration,
+#     TWO backend instances, and an "edge" container (Caddy) that terminates
+#     TLS on https://$PUBLIC_HOST, serves the built SPA, and load-balances
+#     /api + /socket.io + /health across the backends using ACTIVE readiness
+#     checks. Backend ports are deliberately not published — the edge is the
+#     only way in. Needs a root .env with JWT_SECRET (see .env.example).
+
+# Shared definition for every backend instance.
+x-backend: &backend
+  build: ./backend
+  image: codeverse-backend
+  profiles: ["prod"]
+  restart: unless-stopped
+  environment:
+    NODE_ENV:         production
+    PORT:             "4000"
+    DATABASE_URL:     postgresql://postgres:password@postgres:5432/codeverse
+    REDIS_HOST:       redis
+    REDIS_PORT:       "6379"
+    JWT_SECRET:       ${JWT_SECRET:?set JWT_SECRET in .env}
+    CLIENT_ORIGIN:    https://${PUBLIC_HOST:-localhost}
+    SHUTDOWN_DRAIN_MS: "4000"
+  volumes:
+    # The backend drives the HOST daemon to launch sandbox containers. This is
+    # root-equivalent on the host — the same trust a host-run backend had.
+    - /var/run/docker.sock:/var/run/docker.sock
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis:    { condition: service_healthy }
+    migrate:  { condition: service_completed_successfully }
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health/ready || exit 1"]
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 10s
+  # SIGTERM → drain (4 s) → close sockets → flush docs. Must fit inside this.
+  stop_grace_period: 20s
 
 services:
   postgres:
@@ -32,6 +76,57 @@ services:
       timeout: 3s
       retries: 5
 
+  # ── prod profile ────────────────────────────────────────
+
+  # Applies prisma/migrations once, before any backend starts.
+  migrate:
+    build: ./backend
+    image: codeverse-backend
+    profiles: ["prod"]
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://postgres:password@postgres:5432/codeverse
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  backend-1:
+    <<: *backend
+  backend-2:
+    <<: *backend
+
+  # Builds the TypeScript sandbox image on the host daemon so `--build`
+  # produces it; it runs nothing itself. (Dev: `npm run sandbox:build`.)
+  sandbox-ts:
+    build:
+      context: ./backend/sandbox
+      dockerfile: typescript.Dockerfile
+    image: codeverse-sandbox-ts
+    profiles: ["prod"]
+    command: ["true"]
+    restart: "no"
+
+  edge:
+    build:
+      context: .
+      dockerfile: edge/Dockerfile
+    image: codeverse-edge
+    profiles: ["prod"]
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy_data:/data       # certificates + local CA
+      - caddy_config:/config
+    depends_on:
+      backend-1: { condition: service_healthy }
+      backend-2: { condition: service_healthy }
+
 volumes:
   postgres_data:
   redis_data:
+  caddy_data:
+  caddy_config:

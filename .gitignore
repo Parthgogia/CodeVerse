@@ -4,3 +4,6 @@
 # durable companion to it.
 agents.md
 AGENTS.md
+
+# Compose secrets for the prod profile (see .env.example)
+.env

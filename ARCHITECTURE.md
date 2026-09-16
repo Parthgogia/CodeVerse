@@ -78,7 +78,7 @@ the worker shares the API process (§2.5).
 flowchart LR
     BR["BROWSER<br/>Monaco ⇄ Y.Doc replica"]
 
-    LB{{"Load balancer · TLS<br/>NOT DEPLOYED"}}
+    LB{{"EDGE — Caddy<br/>TLS · static SPA · LB with active readiness checks"}}
 
     subgraph BE["ANY BACKEND INSTANCE — stateless, interchangeable"]
         direction TB
@@ -210,9 +210,19 @@ writes, which is precisely why it needs the 4-second debounce and the final flus
 | Redis | 6379 | `docker compose up -d` | |
 | Docker daemon | — | Docker Desktop | Must be running or every code run fails |
 
-**The load balancer is the only box in §2.2 that does not exist yet.** Everything behind it
-is already instance-agnostic and has been verified running as two processes sharing one
-Redis and one Postgres.
+**Production shape** (`docker compose --profile prod up -d --build`, §7.8):
+
+| Process | Port | Notes |
+|---------|------|-------|
+| `edge` (Caddy) | 443 (80 → 308) | TLS, serves the built SPA, load-balances `/api` `/socket.io` `/health` |
+| `backend-1`, `backend-2` | 4000, **not published** | Same image, `docker.sock` mounted for the sandbox |
+| `migrate` | — | One-shot `prisma migrate deploy` before any backend starts |
+| `sandbox-ts` | — | Builds `codeverse-sandbox-ts` on the host daemon, runs nothing |
+| `postgres`, `redis` | 5432, 6379 | Shared with the dev profile |
+
+Every box in §2.2 now exists. The backend was already instance-agnostic; what the edge
+added is *choosing* an instance based on real readiness, and *stopping* choosing one
+before it goes away.
 
 ⚠️ **The API server and the execution worker are the same process.** `startExecWorker(io)`
 is called from `server.ts`, so every API instance also pulls jobs off the queue — which is
@@ -766,17 +776,24 @@ docker run --rm                      delete the container on exit
   --pids-limit 64                    fork-bomb protection
   --ulimit cpu=10:12                 kernel CPU-seconds backstop (SIGXCPU, then SIGKILL)
   --read-only                        immutable container filesystem
-  --tmpfs /tmp:rw,size=32m,exec      the only writable surface
-  -v {hostTmpDir}:/code:ro           user code, mounted read-only
-  -w /code
-  {image} {cmd}
+  --tmpfs /tmp:rw,size=32m,exec      the only writable surface — the code lands here too
+  -w /tmp
+  -i {image} sh -c 'cat > /tmp/{file} && {cmd}'
 ```
 
-Plus, outside Docker: a 10s wall-clock timer, a 64 KB cap on combined stdout+stderr, a
-64 KB cap on the submitted code (`413` at `POST /api/execute`), stdin closed so code
-cannot block on input, and the host temp directory removed in every exit path. All the
-numbers live in `EXEC_LIMITS` in `dockerRunner.ts` and each is overridable via
-`EXEC_*` environment variables (§8).
+**The code arrives over stdin, not a bind mount.** `runInDocker` writes the source into
+the container's stdin and closes it; `cat` lands it on the tmpfs and the language command
+runs. A bind mount needs a path the *daemon* can resolve, and in the `prod` profile the
+backend is itself a container driving the host daemon through `/var/run/docker.sock` — its
+own temp directory means nothing to the host. Stdin works identically for a host process
+and for a container, and leaves nothing to clean up. User code still sees EOF on stdin,
+exactly as it did when stdin was ignored: the whole payload is written and the pipe closed
+before `cat` returns.
+
+Plus, outside Docker: a 10s wall-clock timer, a 64 KB cap on combined stdout+stderr, and a
+64 KB cap on the submitted code (`413` at `POST /api/execute`). All the numbers live in
+`EXEC_LIMITS` in `dockerRunner.ts` and each is overridable via `EXEC_*` environment
+variables (§8).
 
 **How each limit is enforced and what the user sees:**
 
@@ -792,8 +809,7 @@ numbers live in `EXEC_LIMITS` in `dockerRunner.ts` and each is overridable via
 The wall-clock timer used to `SIGKILL` the `docker run` **client** — which detaches the
 CLI but leaves the container running in the daemon. Every infinite loop therefore leaked
 a container pinned at half a core until Docker Desktop fell over. The container is now
-named and removed by name; the promise settles immediately and the mount is deleted only
-after the container is gone.
+named and removed by name and the promise settles immediately.
 
 **Orphan reaper.** The timer lives in the API process, which restarts on every save
 under `tsx watch` and can crash in production; a container outlives its parent. The
@@ -868,10 +884,10 @@ one window and 5 at the start of the next is 10 containers in about a second, tw
 ⚠️ **Limits are per user, not per room or per IP.** Registration and login are unthrottled,
 so account creation itself is not rate limited. 🔲
 
-### 7.8 Horizontal scaling and load balancing ⚠️ 🔲
+### 7.8 Horizontal scaling and load balancing ✅
 
-**What is done ✅.** The backend is stateless with respect to which instance a client
-lands on:
+**The instances were already interchangeable.** The backend is stateless with respect to
+which instance a client lands on:
 
 - `@socket.io/redis-adapter` fans every `io.to(room)` broadcast across instances via
   Redis pub/sub, so edits, cursors, language changes and run results reach the whole
@@ -893,17 +909,60 @@ polling is ever re-enabled as a fallback, sticky sessions (`ip_hash`, or cookie-
 affinity) become mandatory.** This is the single easiest way to break a working
 deployment.
 
-**Not done** 🔲:
+**The edge** (`edge/Caddyfile`, `edge/Dockerfile`) is a single Caddy container that does
+three jobs on one origin:
 
-- No load balancer, no reverse proxy, no TLS termination.
-- No health/readiness endpoints beyond `GET /api/health` (no dependency checks — it
-  returns ok even if Postgres is down).
-- No container image for the backend, no orchestration manifests.
-- No graceful connection draining: shutdown closes sockets and clients reconnect, which
-  the departure grace period (§7.9) masks but does not solve.
+1. **TLS termination.** `tls internal` for `PUBLIC_HOST=localhost` (a local CA — browsers
+   warn until it is trusted); set a real DNS name and remove that line for automatic
+   Let's Encrypt. Port 80 answers `308` to https.
+2. **Static SPA.** The `web/` bundle is built in the image and served from `/srv` with
+   `try_files … /index.html`, so `/room/:id` survives a reload. Because the SPA, `/api`
+   and `/socket.io` share one host, the client is built with *no* `VITE_API_URL` /
+   `VITE_WS_URL` — unset means "same origin" (`api.ts`, `socket.ts`).
+3. **Load balancing with active readiness.** `reverse_proxy backend-1:4000
+   backend-2:4000`, round-robin, probing `/health/ready` every 3 s (2 s timeout) and a
+   5 s passive back-off on errors. WebSocket upgrade is native to Caddy's proxy. Verified:
+   8 requests → 4/4 split; two browsers' sockets on different instances collaborating.
+
+**Real health checks.** Two endpoints with two different questions (`services/health.ts`):
+
+| Endpoint | Question | Answer |
+|----------|----------|--------|
+| `GET /health/live` | Is the process up? | Always `200 { instanceId, uptime }`. For restart decisions. |
+| `GET /health/ready` | Should traffic go here? | `200` only if Postgres `SELECT 1` **and** Redis `PING` answer within 1.5 s **and** the instance is not draining; else `503` with per-check detail. For routing decisions. |
+
+`checks.docker` is reported (from the reaper's last `docker ps`) but never gates readiness:
+execution is asynchronous through the queue, so an instance without Docker still serves
+REST and WebSocket traffic. `GET /api/health` is kept as an alias of `/health/ready`.
+Every response carries `X-Instance-Id`, which is how a deployment is verified from outside.
+
+**Draining.** `shutdown()` now runs in this order: `markDraining()` → wait
+`SHUTDOWN_DRAIN_MS` (4 s) → close sockets → flush documents → disconnect. During the drain
+the instance answers everything it is sent, but `/health/ready` says `503`, so the edge's
+next probe pulls it out of rotation *before* its sockets close. Clients that were on it
+reconnect through the edge to a ready instance and re-emit `room:join` (the client already
+rejoins on every `connect`); the departure grace period hides the blip from peers.
+Measured: the edge stopped choosing a stopping instance **1.9 s** after `docker compose
+stop`, the instance flushed its documents and exited cleanly at 9 s, two browsers kept
+collaborating throughout, no ghost presence entries remained, and the restarted instance
+re-entered rotation with a fresh id. `stop_grace_period: 20s` in compose leaves room for
+drain + flush; the force-exit timer is drain + 10 s.
+
+**Backend image** (`backend/Dockerfile`): multi-stage `node:20-alpine`, built from source
+(not the committed `dist/`), runtime carries only prod `node_modules`, `dist/`, `prisma/`
+and the `docker-cli`. It drives the **host** daemon through the mounted
+`/var/run/docker.sock` — root-equivalent on the host, the same trust a host-run backend
+already had — so it runs as root rather than pretending otherwise. Backend ports are not
+published; the edge is the only way in.
+
+**Still not done** 🔲:
+
+- Orchestration beyond one machine (Kubernetes/Swarm manifests); `--scale backend=N`
+  with Caddy `dynamic a` upstreams would replace the two explicit services.
 - Postgres is a single instance with no read replicas or pooler (PgBouncer). ⚠️ Note the
   double `PrismaClient` (`config/db.ts` and `room.controller.ts` each construct one), so
   the pool count is already double what it should be.
+- The worker still shares the API process (§2.5).
 
 ### 7.9 Presence notifications and the grace period ✅
 
@@ -959,6 +1018,8 @@ revocation list. Logout is client-side only; a stolen token stays valid until it
 | Redis down | Rate limits fail open; presence falls back to local; queue and execution stop ⚠️ |
 | Postgres down | Auth and room endpoints 500; live editing continues; saves retry and fail ⚠️ |
 | Instance SIGKILLed | Ghost presence reaped in ≤30s; unsaved edits since the last 4s debounce are lost ⚠️; in-flight sandbox containers survive it but self-terminate via the CPU ulimit or are swept by the next worker's reaper ✅ |
+| Instance stopped gracefully (SIGTERM) | Readiness → 503, edge stops routing within one probe (≤3 s), sockets close after 4 s, documents flushed, clients reconnect to a ready instance and rejoin ✅ |
+| Postgres or Redis unreachable from one instance | That instance's `/health/ready` → 503; the edge routes around it; it re-enters rotation when the check passes again ✅ |
 | Client disconnects | Reconnects automatically (10 attempts); departure suppressed for 3s ✅ |
 | Deleted room, users inside | `room:deleted` → toast → redirect; cluster-wide purge ✅ |
 | Two instances saving at once | Read-merge-write under a Redis lock; no data loss ✅ |
@@ -991,6 +1052,10 @@ environment variables; 🔲 everything else is a compile-time constant.
 | Departure grace period | 3 s | `room.handlers.ts` |
 | Socket ping timeout / interval | 20 s / 10 s | `socket.ts` |
 | Max socket message | 5 MB | `socket.ts` |
+| Shutdown drain | 4 s (`SHUTDOWN_DRAIN_MS`) | `server.ts` |
+| Health probe timeout (each dependency) | 1.5 s | `services/health.ts` |
+| Edge active check interval / timeout / passive back-off | 3 s / 2 s / 5 s | `edge/Caddyfile` |
+| Compose stop grace period | 20 s | `docker-compose.yml` |
 | Resync after rate-limited `yjs:update` | window TTL + 250 ms (fallback 1.5 s) | `useYjsEditor.ts` |
 | JWT lifetime | 7 days | `auth.controller.ts` |
 | bcrypt cost | 10 | `auth.controller.ts` |
@@ -1010,8 +1075,8 @@ Ordered by how much they would hurt in production.
 5. ~~Delete `app.ts` and `user.routes.ts`~~ ✅ — removed. They were an unmounted early
    scaffold that wrote plaintext passwords and served an unauthenticated user list; never
    reachable, but one stray import away from being so.
-6. **Load balancer + TLS + real health checks** 🔲 — with polling kept disabled, or sticky
-   sessions if not.
+6. ~~Load balancer + TLS + real health checks~~ ✅ — Caddy edge, `/health/live` +
+   `/health/ready`, draining shutdown, backend image; `docker compose --profile prod` (§7.8).
 7. **Membership model** 🔲 — private rooms are currently single-player.
 8. **Document compaction** 🔲 — `docState` grows with edit history forever.
 9. **Sandbox hardening** 🔲 — rootless daemon, non-root user, seccomp profile.

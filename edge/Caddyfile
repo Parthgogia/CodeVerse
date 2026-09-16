@@ -1,0 +1,45 @@
+# CodeVerse edge — TLS termination, static SPA, and the load balancer.
+#
+# One origin for everything: the SPA is served from /srv, and /api, /socket.io
+# and /health are proxied to whichever backend instances are READY. Because
+# the client is websocket-only (no HTTP long-polling), no sticky sessions are
+# needed — a connection is one upgrade to one instance and stays there.
+#
+# PUBLIC_HOST=localhost → `tls internal` issues a certificate from Caddy's own
+# local CA (browsers warn until that CA is trusted; `caddy trust` inside the
+# container prints it). Set PUBLIC_HOST to a real DNS name that resolves here
+# and Caddy obtains a Let's Encrypt certificate automatically instead — delete
+# the `tls internal` line for that.
+
+{$PUBLIC_HOST:localhost} {
+	tls internal
+	encode gzip
+
+	@backend path /api/* /socket.io/* /health/*
+	handle @backend {
+		reverse_proxy backend-1:4000 backend-2:4000 {
+			lb_policy round_robin
+
+			# ACTIVE health checks: an instance is only sent traffic while
+			# /health/ready answers 200. This is what makes draining work —
+			# shutdown() flips readiness to 503 before it closes sockets, and
+			# the next probe (≤ 3 s) pulls the instance out of rotation.
+			health_uri      /health/ready
+			health_interval 3s
+			health_timeout  2s
+
+			# PASSIVE: a request that errors takes the upstream out for 5 s.
+			fail_duration 5s
+
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Everything else is the SPA; unknown paths fall through to index.html
+	# so client-side routes (/dashboard, /room/:id) survive a reload.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

@@ -4,7 +4,10 @@ import { authStorage }      from './auth';
 let socket: Socket | null = null;
 
 function createSocket(): Socket {
-  return io(import.meta.env.VITE_WS_URL ?? 'http://localhost:4000', {
+  // Unset → window.location.origin, so the built SPA reaches the edge proxy's
+  // /socket.io on the same host it was served from (see api.ts for the twin).
+  const url = import.meta.env.VITE_WS_URL?.trim() || undefined;
+  return io(url, {
     auth:                 { token: authStorage.getToken() },
     transports:           ['websocket'],
     autoConnect:          false,

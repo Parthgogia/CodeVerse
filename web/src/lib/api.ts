@@ -1,7 +1,10 @@
 import type { AuthResponse, Room, CreateRoomInput, RunJob } from '../types';
 import { getSocket } from './socket';
 
-const BASE = import.meta.env.VITE_API_URL ?? 'http://localhost:4000';
+// Unset → same origin. In dev the Vite proxy forwards /api to :4000 (web/.env
+// may still point straight at it); in the production image the edge proxy
+// serves the SPA and /api from one host, so relative URLs are exactly right.
+const BASE = import.meta.env.VITE_API_URL?.trim() ?? '';
 
 function getToken(): string | null {
   return localStorage.getItem('codeverse_token');

@@ -45,7 +45,7 @@ function ToastItem({ toast, onRemove }: { toast: Toast; onRemove: (id: string) =
   const [visible, setVisible] = useState(false);
   const [progress, setProgress] = useState(100);
   const colors = COLORS[toast.type];
-  const intervalRef = useRef<ReturnType<typeof setInterval>>();
+  const intervalRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
 
   useEffect(() => {
     // Animate in

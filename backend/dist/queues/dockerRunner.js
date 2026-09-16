@@ -1,7 +1,4 @@
 import { spawn } from "child_process";
-import { tmpdir } from "os";
-import { join } from "path";
-import { writeFile, rm, mkdir } from "fs/promises";
 import { randomBytes } from "crypto";
 // ── Resource limits ───────────────────────────────────────
 // Every run is boxed by all of these at once. Each is overridable via env so a
@@ -29,7 +26,7 @@ const LANG_CONFIG = {
     javascript: {
         image: "node:20-alpine",
         filename: "main.js",
-        cmd: (f) => ["node", f],
+        cmd: (f) => `node ${f}`,
     },
     typescript: {
         // Purpose-built image (sandbox/typescript.Dockerfile) with tsx baked in.
@@ -37,40 +34,41 @@ const LANG_CONFIG = {
         // time — `npx ts-node` used to fail here with EAI_AGAIN on every run.
         image: "codeverse-sandbox-ts",
         filename: "main.ts",
-        cmd: (f) => ["tsx", f],
+        cmd: (f) => `tsx ${f}`,
     },
     python: {
         image: "python:3.12-alpine",
         filename: "main.py",
-        cmd: (f) => ["python", f],
+        cmd: (f) => `python ${f}`,
     },
     cpp: {
         image: "gcc:13",
         filename: "main.cpp",
-        cmd: (f) => {
-            // compile to /tmp since /code is read-only
-            return ["sh", "-c", `g++ -o /tmp/main ${f} && /tmp/main`];
-        },
+        cmd: (f) => `g++ -o /tmp/main ${f} && /tmp/main`,
     },
     java: {
         image: "eclipse-temurin:21-alpine",
         filename: "Main.java",
-        cmd: (f) => {
-            // copy to /tmp and compile/run there since /code is read-only
-            return ["sh", "-c", `cp ${f} /tmp/ && cd /tmp && javac Main.java && java Main`];
-        },
+        cmd: () => `cd /tmp && javac Main.java && java Main`,
     },
 };
 // ── Docker CLI helpers ────────────────────────────────────
+// Rejects on a non-zero exit so "daemon unreachable" is an error, not an
+// empty result — the reaper uses that to report Docker availability.
 function docker(args) {
     return new Promise((resolve, reject) => {
-        const p = spawn("docker", args, { stdio: ["ignore", "pipe", "ignore"] });
-        let out = "";
+        const p = spawn("docker", args, { stdio: ["ignore", "pipe", "pipe"] });
+        let out = "", err = "";
         p.stdout.on("data", (d) => { out += d.toString(); });
+        p.stderr.on("data", (d) => { err += d.toString(); });
         p.on("error", reject);
-        p.on("close", () => resolve(out));
+        p.on("close", (code) => code === 0 ? resolve(out) : reject(new Error(err.trim() || `docker ${args[0]} exited ${code}`)));
     });
 }
+// Set by every reaper sweep from the result of `docker ps`; null until the
+// first sweep. Read by /health/ready — informational, never gating.
+let lastDockerOk = null;
+export function isDockerAvailable() { return lastDockerOk; }
 // `rm -f` rather than `kill`: it works whether the container is still running or
 // has already exited-and-not-yet-been-auto-removed, so it never races `--rm`.
 async function removeContainer(name) {
@@ -90,17 +88,18 @@ export async function runInDocker(code, language, timeoutMs = EXEC_LIMITS.timeou
             executionTimeMs: 0,
         };
     }
-    //Step 1 — Create a unique temp directory for this run
+    // Step 1 — Name the run and decide how the code gets in
     const runId = randomBytes(8).toString("hex");
-    const tmpDir = join(tmpdir(), `codeverse-${runId}`);
-    //Each execution gets its own isolated directory (/tmp/codesync-<random>).
-    // The user's code is written to disk here. randomBytes prevents any two runs from colliding.
-    await mkdir(tmpDir, { recursive: true });
-    const filePath = join(tmpDir, cfg.filename);
-    await writeFile(filePath, code, "utf-8");
-    const containerFile = `/code/${cfg.filename}`;
-    const cmd = cfg.cmd(containerFile);
     const name = `codeverse-exec-${runId}`;
+    // The code is delivered over the container's STDIN, not a bind mount. A
+    // mount needs a path the *daemon* can see, and this process may be running
+    // inside a container of its own (compose `prod` profile) where its temp dir
+    // means nothing to the host daemon. Piping `cat > file` works identically on
+    // a host process and in a container, and leaves nothing to clean up. The
+    // whole payload is written and stdin closed before `cat` returns, so user
+    // code still sees EOF on stdin exactly as it did when stdin was ignored.
+    const file = `/tmp/${cfg.filename}`;
+    const cmd = ["sh", "-c", `cat > ${file} && ${cfg.cmd(file)}`];
     // Kernel-enforced CPU-time backstop. The wall-clock timer below is the primary
     // limit, but it lives in this process — which restarts on every save under
     // `tsx watch` and can crash in production — and a container outlives its
@@ -111,7 +110,7 @@ export async function runInDocker(code, language, timeoutMs = EXEC_LIMITS.timeou
     const cpuSecs = Math.ceil(timeoutMs / 1000);
     // Step 2 — Build the Docker argv
     const dockerArgs = [
-        "run", "--rm", // delete container immediately after exit
+        "run", "--rm", "-i", // delete on exit; -i keeps stdin open for the code
         "--name", name, // addressable, so a timeout can actually kill it
         "--label", CONTAINER_LABEL, // discoverable by the reaper
         "--network", "none", // no internet — can't exfiltrate data or download payloads
@@ -121,9 +120,8 @@ export async function runInDocker(code, language, timeoutMs = EXEC_LIMITS.timeou
         "--pids-limit", String(EXEC_LIMITS.pids), // prevents fork bombs (process.fork() spam)
         "--ulimit", `cpu=${cpuSecs}:${cpuSecs + 2}`, // CPU-seconds backstop (see above)
         "--read-only", // container filesystem is immutable
-        "--tmpfs", `/tmp:rw,size=${EXEC_LIMITS.tmpfsMb}m,exec`, // small writable scratch space (needed by some runtimes)
-        "-v", `${tmpDir}:/code:ro`, // mount user code read-only — container can't modify it
-        "-w", "/code", // working directory inside container
+        "--tmpfs", `/tmp:rw,size=${EXEC_LIMITS.tmpfsMb}m,exec`, // the only writable path; the code lands here too
+        "-w", "/tmp", // working directory inside container
         cfg.image, ...cmd,
     ];
     // Step 3 — Spawn and collect output
@@ -133,22 +131,27 @@ export async function runInDocker(code, language, timeoutMs = EXEC_LIMITS.timeou
         let stderr = "";
         let outBytes = 0;
         let settled = false;
-        const proc = spawn("docker", dockerArgs, { stdio: ["ignore", "pipe", "pipe"] });
-        // stdio: ["ignore", "pipe", "pipe"]` — stdin is disabled (user code can't block waiting for input), stdout and stderr are streamed back in real time.
+        const proc = spawn("docker", dockerArgs, { stdio: ["pipe", "pipe", "pipe"] });
+        // Hand the code to `cat` and close the pipe. If the CLI died before reading
+        // (daemon unreachable) the write raises EPIPE — swallowed here because the
+        // "error"/"close" handlers below already report that case properly.
+        proc.stdin.on("error", () => { });
+        proc.stdin.end(code, "utf-8");
         // Exactly one of these resolves the promise:
         //   proc "close"  → normal exit         → exit code + output
         //   setTimeout    → wall clock exceeded → container removed, exit 124
         //   output cap    → too much output     → container removed, exit 1
         //   proc "error"  → Docker not running  → helpful error message
-        // `finish` is the single exit path so the container is always gone before
-        // the bind-mounted tmpDir is deleted from under it.
+        // `finish` is the single exit path so a run can never resolve twice and
+        // the container is always torn down on the paths that need it.
         const finish = (result, killContainer) => {
             if (settled)
                 return;
             settled = true;
             clearTimeout(timer);
             resolve(result);
-            (killContainer ? removeContainer(name) : Promise.resolve()).then(() => cleanup(tmpDir));
+            if (killContainer)
+                void removeContainer(name);
         };
         // Output is accumulated in *this* process, so an unbounded `while(true)
         // print()` would grow a string here for the whole timeout — the cap protects
@@ -210,12 +213,6 @@ export async function runInDocker(code, language, timeoutMs = EXEC_LIMITS.timeou
         });
     });
 }
-async function cleanup(dir) {
-    try {
-        await rm(dir, { recursive: true, force: true });
-    }
-    catch { }
-}
 // ── Orphan reaper ─────────────────────────────────────────
 /**
  * Removes sandbox containers that have outlived the timeout. Normally there are
@@ -229,7 +226,15 @@ async function cleanup(dir) {
  * starting on the same host never kills a sibling's in-flight run.
  */
 export async function reapOrphanContainers() {
-    const ids = (await docker(["ps", "-q", "--filter", `label=${CONTAINER_LABEL}`])).trim().split(/\s+/).filter(Boolean);
+    let ids;
+    try {
+        ids = (await docker(["ps", "-q", "--filter", `label=${CONTAINER_LABEL}`])).trim().split(/\s+/).filter(Boolean);
+        lastDockerOk = true;
+    }
+    catch (err) {
+        lastDockerOk = false; // the one signal /health/ready reports for Docker
+        throw err;
+    }
     if (!ids.length)
         return 0;
     const cutoff = Date.now() - EXEC_LIMITS.timeoutMs - 15_000;

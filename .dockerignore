@@ -1,0 +1,9 @@
+# Root build context is used by edge/Dockerfile (needs web/) — keep it small.
+**/node_modules
+**/dist
+**/.env
+backend
+.git
+.agents
+agents.md
+*.md
